@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ticker-service
+  namespace: stocksblitz
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ticker-service
+  template:
+    metadata:
+      labels:
+        app: ticker-service
+    spec:
+      containers:
+      - name: ticker-service
+        image: user_service:dev
+        ports:
+        - containerPort: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ticker-service
+  namespace: stocksblitz
+spec:
+  selector:
+    app: ticker-service
+  ports:
+  - port: 80
+    targetPort: 8000

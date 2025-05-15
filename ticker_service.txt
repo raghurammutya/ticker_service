@@ -1,0 +1,3519 @@
+
+C:\stocksblitz\ticker_service\CHANGELOG.md:
+
+C:\stocksblitz\ticker_service\Makefile:
+
+build:
+\tdocker build -t ticker_service:dev -f docker/Dockerfile .
+
+refresh:
+\tdocker build -t ticker_service:dev -f docker/Dockerfile .
+\tkind load docker-image ticker_service:dev
+
+deploy:
+\tkubectl apply -f kubernetes/ticker_service.yaml
+C:\stocksblitz\ticker_service\README.md:
+
+# ticker_service
+Part of the Stocksblitz Platform.
+
+## Quick Commands
+- `make build` — Build Docker image
+- `make deploy` — Apply K8s YAML
+- `make refresh` — Rebuild + load into KIND
+C:\stocksblitz\ticker_service\requirements.txt:
+
+C:\stocksblitz\ticker_service\tag_release.sh:
+
+C:\stocksblitz\ticker_service\ticker_service.txt:
+
+
+C:\stocksblitz\ticker_service\CHANGELOG.md:
+
+C:\stocksblitz\ticker_service\Makefile:
+
+build:
+\tdocker build -t ticker_service:dev -f docker/Dockerfile .
+
+refresh:
+\tdocker build -t ticker_service:dev -f docker/Dockerfile .
+\tkind load docker-image ticker_service:dev
+
+deploy:
+\tkubectl apply -f kubernetes/ticker_service.yaml
+C:\stocksblitz\ticker_service\README.md:
+
+# ticker_service
+Part of the Stocksblitz Platform.
+
+## Quick Commands
+- `make build` — Build Docker image
+- `make deploy` — Apply K8s YAML
+- `make refresh` — Rebuild + load into KIND
+C:\stocksblitz\ticker_service\requirements.txt:
+
+C:\stocksblitz\ticker_service\tag_release.sh:
+
+C:\stocksblitz\ticker_service\ticker_service.txt:
+
+C:\stocksblitz\ticker_service\.github\workflows\dev.yml:
+
+name: Dev - Build and Deploy to KIND
+on:
+  push:
+    branches:
+      - main
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and load dev image
+        run: |
+          docker build -t ticker_service:dev -f docker/Dockerfile .
+          kind load docker-image ticker_service:dev
+      - name: Deploy to KIND
+        run: |
+          kubectl apply -f kubernetes/ticker_service.yaml
+C:\stocksblitz\ticker_service\.github\workflows\prod.yml:
+
+name: Prod - Build and Push to GHCR
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and Push Image
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u raghurammutya --password-stdin
+          docker buildx build --push -t ghcr.io/raghurammutya/ticker_service:latest -f docker/Dockerfile .
+C:\stocksblitz\ticker_service\app\main.py:
+
+import logging
+import os
+import sys
+from fastapi import FastAPI, Request
+from typing import Dict, Any
+import asyncio
+from shared_architecture.config.config_manager import ConfigManager
+from sqlalchemy.orm import Session
+
+print("BROKER_NAME in Environment:", os.getenv("BROKER_NAME"))
+print("USER_NAME in Environment:", os.getenv("USER_NAME"))
+# --- Project Setup ---
+# Get the absolute path to the outermost service directory
+# Get the absolute path of the current file
+# current_file_path = os.path.abspath(__file__)
+
+# # Get the directory containing the current file
+# current_directory = os.path.dirname(current_file_path)
+
+# # Move up one level to set the project root
+# project_root = os.path.dirname(current_directory)
+
+# print(sys.path)
+
+# if project_root not in sys.path:
+#     sys.path.insert(0, project_root)
+#     print(f"Added project root to sys.path: {project_root}")  # Debugging
+os.chdir('/')
+print("Current Directory:", os.getcwd())
+
+# --- Connection Initialization ---
+async def initialize_connections(config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Initialize shared connections (e.g., TimescaleDB, Redis, RabbitMQ).
+
+    Args:
+        config (Dict[str, Any]): The shared configuration.
+
+    Returns:
+        Dict[str, Any]: A dictionary of initialized connections.
+    """
+    from shared_architecture.utils.service_helpers import initialize_service
+    from services.redis_service import RedisService
+
+    try:
+        log_info("Initializing shared connections...")
+        await initialize_service(
+            service_name=config.get("PROJECT_NAME", "ticker_service"),
+            config=config
+        )
+        from shared_architecture.utils.service_helpers import connection_manager
+
+        connections = {
+            "timescaledb": connection_manager.get_timescaledb_session(),
+            "redis": await connection_manager.get_redis_connection(),
+            "rabbitmq": connection_manager.get_rabbitmq_connection(),
+            # "mongodb": connection_manager.get_mongodb_connection(),
+        }
+
+        for name, conn in connections.items():
+            if not conn:
+                raise RuntimeError(f"Failed to establish {name} connection")
+
+        app.state.connections = connections
+        app.state.redis_service = RedisService(
+            redis=app.state.connections.get("redis")  # Pass the Redis connection
+        )
+        log_info("All shared connections successfully initialized.")
+        return connections
+    except Exception as e:
+        log_exception(f"Failed to initialize connections: {e}")
+        raise
+
+# --- Microservice-Specific Startup ---
+async def initialize_microservice(app: FastAPI):
+    """
+    Service-specific startup logic (e.g., brokers, migrations, symbols).
+
+    Args:
+        app (FastAPI): The FastAPI application instance.
+        connections (Dict[str, Any]): Initialized shared connections.
+        config (Dict[str, Any]): The microservice-specific configuration.
+    """
+    from shared_architecture.db.migrations import apply_migrations
+    from services import broker_service,symbol_service
+    from services import rabbitmq_service, timescaledb_service
+    from services.tick_service import process_tick_queue
+    try:
+        log_info("Initializing microservice-specific components...")
+        broker = await broker_service.get_broker_details(
+            app.state.connections["timescaledb"], settings
+        )
+        app.state.broker_instance = await broker_service.initialize_broker(broker[0])
+        await app.state.broker_instance._initialize_connection()
+        await symbol_service.refresh_symbols(app.state.connections["timescaledb"], app)
+
+        log_info("Microservice-specific components initialized successfully.")
+        apply_migrations()
+        log_info("Microservice-specific startup tasks completed.")
+    except Exception as e:
+        log_exception(f"Microservice initialization failed: {e}")
+        raise
+
+# --- FastAPI Application Factory ---
+def create_app(config: Dict[str, Any]) -> FastAPI:
+    """
+    Creates and configures the FastAPI application instance.
+
+    Args:
+        config (Dict[str, Any]): The service-specific configuration.
+
+    Returns:
+        FastAPI: The configured FastAPI application.
+    """
+    global settings
+    from core.config import Settings  # Delayed import
+    settings = Settings(**config.config)
+    app = FastAPI(
+        title=settings.PROJECT_NAME,
+        openapi_url=f"{settings.API_V1_STR}/openapi.json"
+    )
+    app.state.settings = settings
+    return app
+
+# --- Application Instance ---
+service_name = "ticker_service"
+config_manager = ConfigManager(service_name=service_name)
+from core.config import Settings
+settings = Settings(**config_manager.config)
+app = create_app(config_manager)
+
+# Include API Routes
+from api.api_v1 import api_router
+api_prefix = config_manager.config.get("API_V1_STR", "/api/v1")
+app.include_router(api_router, prefix=api_prefix)
+
+# --- Startup Event ---
+connections = None
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    Handles application startup: shared connections and microservice-specific initialization.
+    """
+    try:
+        global connections
+        # Initialize shared connections
+        connections = await initialize_connections(config_manager.config)
+        # Initialize microservice-specific components
+        await initialize_microservice(app)
+
+        # Initialize RedisService
+        redis_connection = app.state.connections.get("redis")
+        if not redis_connection:
+            raise RuntimeError("Redis connection is missing or not initialized.")
+        from services.redis_service import RedisService
+        app.state.redis_service = RedisService(redis=redis_connection)
+
+        # Start background tasks for batch processing and failure queue handling
+        asyncio.create_task(app.state.redis_service.run_batch_processor())
+        asyncio.create_task(app.state.redis_service.process_failure_queue())
+
+        log_info("RedisService initialized and background tasks started.")
+
+    except Exception as e:
+        log_exception(f"Startup failed: {e}")
+        raise
+
+        log_info("Application startup complete.")
+    except Exception as e:
+        log_exception(f"Application startup failed: {e}")
+        raise
+
+# --- Shutdown Event ---
+@app.on_event("shutdown")
+async def shutdown_event():
+    """
+    Handles application shutdown: closing shared connections.
+    """
+    from shared.utils.service_helpers import connection_manager
+    app.state.broker_instance.disconnect()
+    connection_manager.close_all()
+    log_info("Application shutdown complete.")
+
+# --- Health Check ---
+@app.get("/health")
+async def health_check():
+    """
+    Combined health check endpoint for Redis, async jobs, and broker instance.
+
+    Returns:
+        dict: Health status including Redis, async jobs, and broker instance.
+    """
+    # Default broker status
+    broker_status = "unhealthy"
+
+    # Check broker instance health
+    try:
+        broker_instance = app.state.broker_instance
+        if broker_instance and broker_instance.broker_session:  # Assuming the broker has an `is_connected()` method
+            broker_status = "healthy"
+    except Exception as e:
+        log_exception(f"Broker health check failed: {e}")
+        broker_status = "unhealthy"
+
+    # Check Redis and async job statuses
+    redis_health = await app.state.redis_service.health_check()
+
+    # Return combined health status
+    return {
+        "redis_status": redis_health["status"],
+        "batch_processor_status": redis_health["batch_processor_status"],
+        "failure_queue_status": redis_health["failure_queue_status"],
+        "broker_status": broker_status
+    }
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    print(Request)
+    response = await call_next(request)
+    return response
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",  # Run from app/main.py
+        host="0.0.0.0",
+        port=8000,
+        reload=True
+    )
+C:\stocksblitz\ticker_service\app\api\api_v1.py:
+
+from fastapi import APIRouter
+import os
+print("Current Working Directory:", os.getcwd())
+
+from api.endpoints import feeds, historical_data, symbols, subscriptions
+
+api_router = APIRouter()
+
+api_router.include_router(feeds.router, prefix="/feeds", tags=["feeds"])
+api_router.include_router(historical_data.router, prefix="/historical_data", tags=["historical_data"])
+api_router.include_router(symbols.router, prefix="/symbols", tags=["symbols"])
+api_router.include_router(subscriptions.router, prefix="/subscriptions", tags=["subscriptions"])
+print("Routers registered in api_v1.py:", api_router.routes)
+C:\stocksblitz\ticker_service\app\api\__init__.py:
+
+from .api_v1 import api_router
+C:\stocksblitz\ticker_service\app\api\endpoints\feeds.py:
+
+import asyncio
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from schemas import feed as feed_schema
+from services import broker_service, rabbitmq_service, timescaledb_service
+from shared_architecture.db import get_db
+from shared_architecture.errors.custom_exceptions import ServiceUnavailableError
+from typing import List, Dict, Any
+from core.dependencies import get_app
+import logging
+# from shared_architecture.utils.service_helpers import connection_manager  # Old way
+from core.dependencies import get_rabbitmq_connection  # New way
+
+router = APIRouter()
+
+@router.post("/feeds/", response_model=feed_schema.Feed, status_code=201)
+async def create_feed(
+    feed: feed_schema.FeedCreate,
+    db: Session = Depends(get_db),
+):
+    """
+    Endpoint to receive and process real-time feeds.
+    """
+    try:
+        # 1. Validate the feed data (Pydantic schema)
+        # 2. Store in TimescaleDB
+        db_feed = await timescaledb_service.create_tick_data(db, feed)
+
+        # 3. Publish to RabbitMQ
+        await rabbitmq_service.publish_tick_data(feed.dict())  # Ensure it's a dict
+
+        return db_feed
+    except Exception as e:
+        log_exception(f"Error processing feed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except rabbitmq_service.RabbitMQConnectionError as e:  # Example
+        raise ServiceUnavailableError(service_name="RabbitMQ", message=str(e))
+
+@router.get("/feeds/", response_model=List[feed_schema.Feed])
+async def get_feeds(db: Session = Depends(get_db)):
+    """
+    Endpoint to retrieve feeds (for debugging/testing).
+    """
+    feeds = await timescaledb_service.get_all_tick_data(db)
+    return feeds
+
+# Add this endpoint to simulate ticks
+
+@router.post("/simulate_ticks/")
+async def simulate_ticks(interval: float = 1.0):
+    """
+    Starts tick simulation via Breeze.
+    """
+    app = get_app()
+    breeze = app.state.broker_instance  # Assuming broker_instance is a Breeze instance
+    return await breeze.start_simulation(interval=interval)
+
+@router.post("/stop_simulate_ticks/")
+async def stop_simulate_ticks():
+    """
+    Stops tick simulation via Breeze.
+    """
+    app = get_app()
+    breeze = app.state.broker_instance
+    return await breeze.stop_simulation()
+C:\stocksblitz\ticker_service\app\api\endpoints\historical_data.py:
+
+import os
+from fastapi import APIRouter, Depends, HTTPException,Request
+from sqlalchemy.orm import Session
+from schemas.historical_data import HistoricalDataRequest,HistoricalDataCreate
+from services import broker_service, timescaledb_service
+from services import broker_service, symbol_service
+import logging
+
+from shared_architecture.db.models.broker import Broker
+from shared_architecture.db.session import get_db
+from typing import List
+import datetime
+import asyncio
+
+
+router = APIRouter()
+logging.basicConfig(
+level=logging.INFO,
+format="%(asctime)s - %(levelname)s - %(message)s",
+)
+def get_broker(request: Request) -> str:
+    """
+    Retrieve broker name from environment variables.
+    """
+    return os.getenv("BROKER_NAME", "")  # Use a default if not set
+async def check_api_rate_limit(db: Session, broker):
+    """
+    Checks if the API rate limit has been exceeded.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if broker.minute_api_limit is not None:
+        if broker.minute_api_requests >= broker.minute_api_limit and (now - broker.last_api_call_time) < datetime.timedelta(minutes=1):
+            raise HTTPException(status_code=429, detail="Minute API limit exceeded")
+
+    if broker.daily_api_limit is not None:
+        if (now.date() - broker.last_api_call_time.date()).days >= 1:
+            broker.minute_api_requests = 0
+
+    broker.minute_api_requests += 1
+    broker.last_api_call_time = now
+    db.commit()
+
+
+@router.post("/fetch/", response_model=List[HistoricalDataCreate])
+async def fetch_historical_data(
+    request: Request, 
+    data_request: HistoricalDataRequest,
+):
+    """
+    Endpoint to trigger fetching historical data from the broker.
+    """
+    try:
+        # Retrieve Breeze instance from FastAPI state
+        breeze_instance = request.app.state.broker_instance
+
+        # Fetch historical data (converted DataFrame -> dict)
+        fetched_data = breeze_instance.get_historical_data(data_request)
+
+        from shared_architecture.utils.service_helpers import connection_manager
+        db=connection_manager.get_timescaledb_session()
+        # Batch insert data into TimescaleDB
+        stored_data = await timescaledb_service.batch_upsert_historical_data(db,fetched_data)
+
+        return fetched_data
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        log_exception(f"Error fetching historical data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+
+
+@router.post("/", response_model=List[HistoricalDataRequest], status_code=200)
+async def create_historical_data(
+    data: List[HistoricalDataCreate],
+    broker_name: str = Depends(get_broker),
+):
+    """
+    Endpoint to receive and store historical data.
+    """
+    try:
+        stored_data = []
+        for item in data:
+            stored_data.append(await timescaledb_service.upsert_historical_data(db, item))
+        return stored_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{instrument_key}", response_model=List[HistoricalDataRequest])
+async def get_historical_data(instrument_key: str, db: Session = Depends(get_db)):
+    """
+    Endpoint to retrieve historical data for a specific instrument.
+    """
+    data = await timescaledb_service.get_historical_data_by_instrument_key(db, instrument_key)
+    if not data:
+        raise HTTPException(status_code=404, detail="Historical data not found")
+    return data
+
+
+C:\stocksblitz\ticker_service\app\api\endpoints\subscriptions.py:
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+import logging
+from sqlalchemy.orm import Session
+from schemas import subscription as subscription_schema
+from services import broker_service, symbol_service
+from pydantic import BaseModel, Field
+from shared_architecture.db.models.broker import Broker
+from shared_architecture.db.session import get_db
+# Pydantic model to ensure arbitrary types are allowed
+
+# Router declaration
+router = APIRouter(tags=["subscriptions"])
+
+import os
+
+
+def get_broker(request: Request) -> str:
+    """
+    Retrieve broker name from environment variables.
+    """
+    return os.getenv("BROKER_NAME", "")  # Use a default if not set
+
+@router.get("/test-subscriptions", status_code=200)
+async def test_subscriptions():
+    """Test route for subscriptions"""
+    return {"message": "Test subscriptions route works"}
+
+@router.post("/", status_code=200)
+async def subscribe_to_symbol(
+    request: Request,
+    subscription: subscription_schema.SubscriptionCreate,
+    broker_name: str = Depends(get_broker), 
+    interval: str = '1second',
+    get_market_depth: bool = False,
+    get_exchange_quotes: bool = True
+):
+    """
+    Endpoint to subscribe to a symbol for real-time feeds.
+    """
+    try:
+        # Retrieve broker-specific token
+        # broker_token = await symbol_service.get_broker_token(
+        #     subscription.instrument_key, broker_name
+        # )
+
+        breeze_instance = request.app.state._state['broker_instance']
+
+
+        breeze_instance.subscribe(instrument_key=subscription.instrument_key,
+                                interval = '1second',
+                                get_market_depth = False,
+                                get_exchange_quotes = True)
+
+        # Additional logic to handle subscription
+
+        return {"message": f"Subscription successful for broker: {broker_name}"}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        log_exception(f"Error subscribing to symbol: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/unsubscribe/", status_code=200)
+async def unsubscribe_from_symbol(
+    request: Request,
+    subscription: subscription_schema.SubscriptionCreate,
+    db: Session = Depends(get_db),
+    broker_name: str = Depends(get_broker), 
+):
+    """
+    Endpoint to unsubscribe from a symbol.
+    """
+    try:
+        # Retrieve broker-specific token
+        broker_token = await symbol_service.get_broker_token(
+            subscription.instrument_key, broker_name
+        )
+        
+        breeze_instance = request.app.state._state['broker_instance']
+
+        # Unsubscribe logic
+        breeze_instance.unsubscribe(broker_token=broker_token)
+        return {"message": "Unsubscription successful"}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        log_exception(f"Error unsubscribing from symbol: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+C:\stocksblitz\ticker_service\app\api\endpoints\symbols.py:
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from schemas import symbol as symbol_schema
+from services import broker_service, symbol_service
+from shared_architecture.db import get_db
+from typing import List
+
+router = APIRouter()
+
+@router.get("/symbols/{instrument_key}", response_model=symbol_schema.Symbol)
+async def get_symbol(instrument_key: str, db: Session = Depends(get_db)):
+    """
+    Endpoint to retrieve symbol details.
+    """
+    symbol = await symbol_service.get_symbol_by_instrument_key(db, instrument_key)
+    if not symbol:
+        raise HTTPException(status_code=404, detail="Symbol not found")
+    return symbol
+
+@router.get("/symbols/", response_model=List[symbol_schema.Symbol])
+async def get_all_symbols(db: Session = Depends(get_db)):
+    """
+    Endpoint to retrieve all symbols.
+    """
+    symbols = await symbol_service.get_all_symbols(db)
+    return symbols
+
+@router.post("/symbols/refresh/", status_code=200)
+async def refresh_symbols(db: Session = Depends(get_db)):
+    """
+    Endpoint to trigger symbol refresh.
+    """
+    try:
+        await symbol_service.refresh_symbols(db)
+        return {"message": "Symbol refresh started"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+C:\stocksblitz\ticker_service\app\api\endpoints\__init__.py:
+
+C:\stocksblitz\ticker_service\app\brokers\breeze.py:
+
+import os
+import zipfile
+import pandas as pd
+import numpy as np
+import logging
+import threading
+from datetime import datetime, timedelta,date
+from typing import List,Union, Dict, Any,Optional,Type,Callable
+from schemas import symbol as symbol_schema
+from models import symbol as symbol_model
+from schemas import historical_data as historical_data_schema
+from services import rabbitmq_service
+from services.redis_service import RedisService
+
+from models import tick_data as tick_data_model
+from sqlalchemy.orm import Session
+import aiohttp
+import pytz
+from zoneinfo import ZoneInfo
+from core.config import Settings
+from sqlalchemy import inspect
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from breeze_connect import BreezeConnect
+from utils.data_utils import safe_parse_datetime,safe_convert,safe_convert_bool,safe_convert_int,safe_convert_float  # Import the library
+from dateutil import parser
+import json
+import time as t
+from core.dependencies import get_app
+class Broker:
+    def __init__(self, broker_record):
+        """
+        Initializes the Breeze broker connection.
+        """
+        self.broker_record = broker_record
+        self.api_key = broker_record.api_key
+        self.api_secret = broker_record.api_secret
+        self.symbol_url = broker_record.symbol_url  # Ensure this is in settings
+        self.broker = None  # BreezeConnect instance
+        self.broker_session = None
+        self.executor = ThreadPoolExecutor(max_workers=5)  # Adjust as needed
+        self.working_directory = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),  # app directory
+            "tmp"
+        )
+        self.simulation_task = None
+        self.app=get_app()
+        self.redis_service =self.app.state.connections['redis']
+        self.tick_queue: asyncio.Queue = asyncio.Queue()
+        os.makedirs(self.working_directory, exist_ok=True) 
+        self.instrument_keys = [
+            "NSE@NIFTY@options@31-12-2024@call@19800",
+            "NSE@NIFTY@futures@31-12-2024",
+            "BSE@RELIANCE@equities"
+        ]  # Sample instrument keys
+        self.tick_count = 0
+        
+        
+    async def start_simulation(self, interval: float = 1.0):
+        """
+        Starts simulating tick data at the specified interval.
+
+        Args:
+            interval (float): Interval in seconds between each tick.
+        """
+        try:
+            if self.simulation_task and not self.simulation_task.done():
+                log_warning("Simulation is already running.")
+                return {"message": "Simulation is already running."}
+
+            async def simulate_ticks():
+                while True:
+                    for instrument_key in self.instrument_keys:
+                        tick_data = self._generate_mock_tick(instrument_key)
+                        await self._handle_tick_data(tick_data)  # Handle the tick data
+                        log_info(f"Mock: Sent tick for {instrument_key}")
+                        await asyncio.sleep(interval)  # Wait for the interval
+
+            log_info("Starting tick simulation...")
+            self.simulation_task = asyncio.create_task(simulate_ticks())
+            return {"message": "Tick simulation started."}
+
+        except Exception as e:
+            log_exception(f"Error in start_simulation: {e}")
+            raise
+
+    async def stop_simulation(self):
+        """
+        Stops the ongoing tick simulation.
+        """
+        try:
+            if self.simulation_task and not self.simulation_task.done():
+                self.simulation_task.cancel()
+                try:
+                    await self.simulation_task  # Wait for cancellation
+                except asyncio.CancelledError:
+                    log_info("Simulation task canceled successfully.")
+                self.simulation_task = None  # Reset the task
+                return {"message": "Tick simulation stopped."}
+            else:
+                log_warning("No active simulation to stop.")
+                return {"message": "No active simulation to stop."}
+
+        except Exception as e:
+            log_exception(f"Error in stop_simulation: {e}")
+            raise
+
+
+
+    async def _initialize_connection(self):
+        """
+        Establishes the connection with the Breeze API.
+        """
+        try:
+            # Check if session is valid
+            if self.broker_record.session_key_date != datetime.now().date():
+                raise Exception("Session token is expired")
+
+            # Initialize BreezeConnect and generate session
+            self.broker = BreezeConnect(api_key=self.api_key)
+            self.broker.generate_session(
+                api_secret=self.api_secret,
+                session_token=self.broker_record.session_token
+            )
+            self.broker_session = True  # Setting to True as it is used for checking.
+            log_info("Breeze: Connection initialized successfully.")
+            self.broker.ws_connect()
+            self.broker.on_ticks = self._handle_tick_data_sync
+            log_info(f"Breeze: Ready to receive real time feeds")
+        except Exception as e:
+            log_exception(f"Breeze: Failed to initialize connection: {e}")
+            raise
+    def get_model_column_names(self,model_class):
+        """
+        Retrieves a list of column names from a SQLAlchemy model.
+
+        Args:
+            model_class: The SQLAlchemy model class (e.g., MyModel).
+
+        Returns:
+            A list of column names (strings).
+        """
+
+        inspector = inspect(model_class)
+        column_names = [column.name for column in inspector.columns]
+        return column_names
+    async def disconnect(self):
+        """
+        Closes the connection with the Breeze API.
+        """
+        try:
+            if self.broker:
+                self.broker.ws_disconnect()  # If BreezeConnect has a logout method
+            self.broker = None
+            self.broker_session = None
+            log_info("Breeze: Connection closed.")
+        except Exception as e:
+            log_exception(f"Breeze: Failed to disconnect: {e}")
+
+    async def get_symbols(self) -> List[symbol_schema.SymbolCreate]:
+        """
+        Retrieves and processes symbol data from Breeze.
+        """
+        try:
+            symbol_target_dir = self.working_directory
+            if not self._is_downloaded_today(os.path.join(symbol_target_dir, os.path.basename(self.symbol_url))):
+                downloaded_file = await self._download_file(self.symbol_url, symbol_target_dir)
+                if downloaded_file:
+                    await self._extract_zip(downloaded_file, symbol_target_dir)
+                    log_info("Breeze: Downloaded and extracted symbol files.")
+
+            # Process files in parallel
+            files_to_process = ["FONSEScripMaster.txt", "FOBSEScripMaster.txt", "NSEScripMaster.txt", "BSEScripMaster.txt"]
+            file_paths = [os.path.join(symbol_target_dir, file) for file in files_to_process]
+            loop = asyncio.get_event_loop()
+            tasks = [loop.run_in_executor(self.executor, self._process_data_file, file_path) for file_path in file_paths]
+            results = await asyncio.gather(*tasks)
+            symbols = []
+            for result in results:
+                symbols.extend(result)
+
+            return symbols
+            #symbols = [symbol_schema.SymbolCreate(**row) for row in all_symbols_data.to_dict(orient='records')]
+
+            #return symbols
+
+        except Exception as e:
+            log_exception(f"Breeze: Error getting symbols: {e}")
+            raise
+
+    def _process_data_file(self, filepath) -> pd.DataFrame:
+        """
+        Processes a single symbol data file.
+        """
+        try:
+            def generate_instrument_key(row):
+                """Generates instrument_key based on the Product_Type and other columns."""
+                if row['Product_Type'] == 'futures':
+                    return f"{row['Exchange']}@{row['Stock_Code']}@{row['Product_Type']}@{row['Expiry_Date']}"
+                elif row['Product_Type'] == 'options':
+                    return f"{row['Exchange']}@{row['Stock_Code']}@{row['Product_Type']}@{row['Expiry_Date']}@{row['Option_Type']}@{row['Strike_Price']}"
+                elif row['Product_Type'] == 'equities':
+                    return f"{row['Exchange']}@{row['Stock_Code']}@{row['Product_Type']}"
+
+            # Apply the function once across the DataFrame
+
+            log_info(f"Breeze: Starting process of {filepath}")
+            db_columns = [
+                "instrument_key", "Exchange", "Stock_Code", "Product_Type", "Expiry_Date",
+                "Option_Type", "Strike_Price", "Stock_Token", "Instrument_Name", "Series",
+                "Ca_Level", "Permitted_To_Trade", "Issue_Capital", "Warning_Qty", "Freeze_Qty",
+                "Credit_Rating", "Normal_Market_Status", "Odd_Lot_Market_Status", "Spot_Market_Status",
+                "Auction_Market_Status", "Normal_Market_Eligibility", "Odd_Lot_Market_Eligibility",
+                "Spot_Market_Eligibility", "Auction_Market_Eligibility", "Scrip_Id", "Issue_Rate",
+                "Issue_Start_Date", "Interest_Payment_Date", "Issue_Maturity_Date", "Margin_Percentage",
+                "Minimum_Lot_Qty", "Lot_Size", "Tick_Size", "Company_Name", "Listing_Date",
+                "Expulsion_Date", "Readmission_Date", "Record_Date", "Low_Price_Range",
+                "High_Price_Range", "Security_Expiry_Date", "No_Delivery_Start_Date",
+                "No_Delivery_End_Date", "Mf", "Aon", "Participant_In_Market_Index",
+                "Book_Cls_Start_Date", "Book_Cls_End_Date", "Exercise_Start_Date", "Exercise_End_Date",
+                "Old_Token", "Asset_Instrument", "Asset_Name", "Asset_Token", "Intrinsic_Value",
+                "Extrinsic_Value", "Exercise_Style", "Egm", "Agm", "Interest", "Bonus", "Rights",
+                "Dividends", "Ex_Allowed", "Ex_Rejection_Allowed", "Pl_Allowed", "Is_This_Asset","Board_Lot_Qty", 
+                "Date_Of_Delisting","Date_Of_Listing","Face_Value","Freeze_Percent","High_Date","ISIN_Code",
+                "Instrument_Type","Issue_Price","Life_Time_High","Life_Time_Low","Low_Date", 	"AVM_Buy_Margin",
+	            "AVM_Sell_Margin","BCast_Flag","Group_Name","Market_Lot","NDE_Date","NDS_Date","Nd_Flag","Scrip_Code",
+	            "Scrip_Name","Susp_Status","Suspension_Reason","Suspension_Date",
+                "Is_Corp_Adjusted", "Local_Update_Datetime", "Delete_Flag", "Remarks", "Base_Price",
+                "Exchange_Code", "Refresh_Flag", "Breeze_Token", "Kite_Token"
+            ]
+
+            if "FONSEScripMaster.txt" in filepath:
+                symbols = pd.read_csv(filepath, header=0)
+                # Clean up column names (MOST IMPORTANT)
+                symbols.columns = symbols.columns.str.strip().str.replace('"', '', regex=False)
+                rename_dict=self.rename_columns_from_list(symbols.columns)
+                
+                #rename_dict = {col: self.to_snake_case(col).replace(" ","_") for col in symbols.columns}
+                symbols.rename(columns=rename_dict, inplace=True)
+
+                Exchange = 'NFO'
+                symbols['Exchange'] = Exchange
+                symbols['Product_Type'] = np.where(symbols['Series'] == 'FUTURE', 'futures',
+                                                np.where(symbols['Series'] == 'OPTION', 'options', symbols['Series']))
+                symbols['Option_Type'] = np.where(symbols['Option_Type'] == 'CE', 'call',
+                                                np.where(symbols['Option_Type'] == 'PE', 'put', symbols['Option_Type']))
+                symbols = symbols.rename(columns={'ShortName': 'Stock_Code'})
+                symbols = symbols.rename(columns={'Token': 'Breeze_Token'})
+                required_columns = ["Exchange_Code", "Product_Type", "Stock_Code", "Expiry_Date", "Option_Type", "Strike_Price"]
+                if not set(required_columns).issubset(symbols.columns):
+                    raise KeyError(f"Missing columns: {set(required_columns) - set(symbols.columns)}")
+
+                if 'Expiry_Date' in symbols:
+                    symbols['Expiry_Date'] = symbols['Expiry_Date'].fillna('')
+
+                if 'Option_Type' in symbols:
+                    symbols['Option_Type'] = symbols['Option_Type'].fillna('')
+
+                if 'Strike_Price' in symbols:
+                    symbols['Strike_Price'] = symbols['Strike_Price'].fillna('')
+                symbols['Strike_Price'] = symbols['Strike_Price'].astype(str).str.replace(r'\.0', '', regex=True)
+                symbols['Strike_Price'] = pd.to_numeric(symbols['Strike_Price'], errors='coerce')
+                symbols['instrument_key'] = symbols.apply(generate_instrument_key, axis=1)
+
+
+                symbols = symbols.sort_values(by=['Stock_Code', 'Product_Type', 'Expiry_Date', 'Option_Type', 'Strike_Price'])
+
+            elif "NSEScripMaster.txt" in filepath:
+                symbols = pd.read_csv(filepath, header=0)
+                # Clean up column names (MOST IMPORTANT)
+                symbols.columns = symbols.columns.str.strip().str.replace('"', '', regex=False)
+                rename_dict=self.rename_columns_from_list(symbols.columns)
+                #rename_dict = {col: self.to_snake_case(col).replace(" ","_") for col in symbols.columns}
+                symbols.rename(columns=rename_dict, inplace=True)
+                Exchange = 'NSE'
+                symbols['Exchange'] = Exchange
+                symbols['Product_Type'] = 'equities'
+                symbols = symbols.rename(columns={'ShortName': 'Stock_Code'})
+                symbols = symbols.rename(columns={'Token': 'Breeze_Token'})
+                required_columns = ["Exchange_Code", "Product_Type", "Stock_Code"]
+                if not set(required_columns).issubset(symbols.columns):
+                    raise KeyError(f"Missing columns: {set(required_columns) - set(symbols.columns)}")
+
+                symbols['instrument_key'] = symbols.apply(generate_instrument_key, axis=1)
+
+            elif "BSEScripMaster.txt" in filepath and "FOBSEScripMaster.txt" not in filepath:
+                symbols = pd.read_csv(filepath, header=0)
+                # Clean up column names (MOST IMPORTANT)
+                symbols.columns = symbols.columns.str.strip().str.replace('"', '', regex=False)
+                rename_dict=self.rename_columns_from_list(symbols.columns)
+                #rename_dict = {col: self.to_snake_case(col).replace(" ","_") for col in symbols.columns}
+                symbols.rename(columns=rename_dict, inplace=True)
+                
+                Exchange = 'BSE'
+                symbols['Exchange'] = Exchange
+                symbols = symbols.rename(columns={'ShortName': 'Stock_Code'})
+                symbols = symbols.rename(columns={'Token': 'Breeze_Token'})
+                symbols['Product_Type'] = 'equities'
+                required_columns = ["Exchange", "Product_Type", "Stock_Code"]
+                if not set(required_columns).issubset(symbols.columns):
+                    raise KeyError(f"Missing columns: {set(required_columns) - set(symbols.columns)}")
+
+                symbols['instrument_key'] = symbols.apply(generate_instrument_key, axis=1)
+
+            elif "FOBSEScripMaster.txt" in filepath:
+                symbols = pd.read_csv(filepath, header=0)
+                # Clean up column names (MOST IMPORTANT)
+                symbols.columns = symbols.columns.str.strip().str.replace('"', '', regex=False)
+                rename_dict=self.rename_columns_from_list(symbols.columns)
+                #rename_dict = {col: self.to_snake_case(col).replace(" ","_") for col in symbols.columns}
+                symbols.rename(columns=rename_dict, inplace=True)
+                Exchange = 'BSO'
+
+                symbols['Exchange'] = Exchange
+                symbols['Product_Type'] = np.where(symbols['Series'] == 'FUTURE', 'futures',
+                                                np.where(symbols['Series'] == 'OPTION', 'options', symbols['Series']))
+                symbols['Option_Type'] = np.where(symbols['Option_Type'] == 'CE', 'call',
+                                                np.where(symbols['Option_Type'] == 'PE', 'put', symbols['Option_Type']))
+                symbols = symbols.rename(columns={'ShortName': 'Stock_Code'})
+                symbols = symbols.rename(columns={'Token': 'Breeze_Token'})
+                required_columns = ["Exchange_Code", "Product_Type", "Stock_Code", "Expiry_Date", "Option_Type", "Strike_Price"]
+                if not set(required_columns).issubset(symbols.columns):
+                    raise KeyError(f"Missing columns: {set(required_columns) - set(symbols.columns)}")
+                if 'Expiry_Date' in symbols:
+                    symbols['Expiry_Date'] = symbols['Expiry_Date'].fillna('')
+
+                if 'Option_Type' in symbols:
+                    symbols['Option_Type'] = symbols['Option_Type'].fillna('')
+
+                if 'Strike_Price' in symbols:
+                    symbols['Strike_Price'] = symbols['Strike_Price'].fillna('')
+                symbols['Strike_Price'] = symbols['Strike_Price'].astype(str).str.replace(r'\.0', '', regex=True)
+                symbols['Strike_Price'] = pd.to_numeric(symbols['Strike_Price'], errors='coerce')
+                symbols['instrument_key'] = symbols.apply(generate_instrument_key, axis=1)
+
+                
+                symbols = symbols.sort_values(by=['Stock_Code', 'Product_Type', 'Expiry_Date', 'Option_Type', 'Strike_Price'])
+
+            else:
+                log_warning(f"Breeze: Unsupported file: {filepath}")
+                return pd.DataFrame()
+
+            symbols = symbols.replace(np.nan, None)
+            # Check for empty instrument_key (Added code)
+            empty_key_rows = symbols[symbols['instrument_key'] == '']
+            if not empty_key_rows.empty:
+                log_warning(f"Breeze: Found {len(empty_key_rows)} rows with empty instrument_key in {filepath}")
+                print(f"Rows with empty instrument_key in {filepath}:\n{empty_key_rows}")
+
+            # inspector = inspect(self.db.bind) #This is not available here.
+            processed_symbols = pd.DataFrame()
+            new_series = []
+            for col in db_columns:
+                if col in symbols.columns:
+                    new_series.append(pd.Series([None] * len(symbols), index=symbols.index, name=col))
+                    #processed_symbols[col] = symbols[col]  # Copy the existing column
+                else:
+                    # Concatenate the new Series with the original DataFrame
+                    if new_series:
+                        symbols = pd.concat([symbols] + new_series, axis=1)
+                    #processed_symbols[col] = pd.Series([None] * len(symbols), index=symbols.index) # Create a new Series
+                # Reindex for consistency (optional, but often recommended)
+                symbols = symbols.reindex(columns=db_columns, fill_value=None)
+            processed_symbols=symbols
+            for col in processed_symbols.select_dtypes(include=['object']).columns:
+                if processed_symbols[col].dtype == 'object':
+                    processed_symbols[col] = processed_symbols[col].str.strip("'")
+
+
+
+            # Date Conversions
+            if 'Expiry_Date' in symbols.columns:
+                symbols['Expiry_Date'] = pd.to_datetime(symbols['Expiry_Date'], errors='coerce')
+                symbols['Expiry_Date'] = symbols['Expiry_Date'].dt.tz_localize('Asia/Kolkata').dt.date
+            symbols['Local_Update_Datetime']= datetime.now()
+
+            # Boolean Conversions
+            boolean_columns = [
+                "Permitted_To_Trade", "Ex_Rejection_Allowed", "Pl_Allowed", "Is_This_Asset",
+                "Is_Corp_Adjusted", "Delete_Flag", "Refresh_Flag"
+            ]
+            for col in boolean_columns:
+                if col in symbols.columns:
+                    symbols[col] = symbols[col].apply(lambda x: True if x == 1 or str(x).lower() == 'true' else False if x == 0 or str(x).lower() == 'false' else None)
+            symbols_list = []
+
+            for index, row in symbols.iterrows():
+                symbol_dict = row.to_dict()  # Convert each row to a dictionary
+                processed_row = self.process_data_row(symbol_dict) #Process the row
+                symbols_list.append(processed_row)
+
+            return symbols_list
+        except Exception as e:
+            log_exception(f"Breeze: Error processing data file {filepath}: {e}")
+
+            return pd.DataFrame()
+
+    def rename_columns_from_list(self, target_columns: List[str]) -> Dict[str, str]:
+        """
+        Creates a mapping dictionary to rename DataFrame columns based on a target list,
+        ignoring case and underscores.
+
+        Args:
+            symbols: The input Pandas DataFrame.
+            target_columns: A list of target column names (e.g., your schema fields).
+
+        Returns:
+            A dictionary where keys are original column names and values are new column names.
+        """
+        column_list = self.get_model_column_names(symbol_model.Symbol)
+        rename_dict: Dict[str, str] = {}  # Initialize an empty dictionary
+
+        for original_col in column_list:
+            normalized_original = original_col.strip("_ ").lower().replace("_", "")
+            for target_col in target_columns:
+                normalized_target = target_col.strip("_ ").lower().replace("_", "")
+                if normalized_original == normalized_target:
+                    rename_dict[target_col] = original_col
+                    break  # Stop searching once a match is found
+        if "AuctionlMarketEligibility" in target_columns:
+            rename_dict["AuctionlMarketEligibility"] = "Auction_Market_Eligibility"
+        if "OddLotlMarketEligibility" in target_columns:
+            rename_dict["OddLotlMarketEligibility"] = "Odd_Lot_Market_Eligibility"
+        return rename_dict
+
+
+    def process_data_row(self,row: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Processes a single data row to match the Symbol schema.
+        """
+        processed_row: Dict[str, Any] = {}
+
+        # def safe_convert(value: Any, target_type: Type, default: Optional[Any] = None):
+        #     """
+        #     Safely converts a value to the target type, handling None and potential conversion errors.
+        #     """
+        #     if value is None:
+        #         return default
+        #     try:
+        #         return target_type(value)
+        #     except (ValueError, TypeError):
+        #         return default
+        #     except Exception as e:
+        #         print(f"Unexpected error during conversion: {e}")
+        #         return default
+            
+        # def safe_convert_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+        #     """
+        #     Safely converts a value to an integer, handling None and potential errors.
+
+        #     Args:
+        #         value: The value to convert.
+        #         default: The value to return if conversion fails or if value is None.
+
+        #     Returns:
+        #         The converted integer, or the default if conversion fails or value is None.
+        #     """
+        #     if value is None:
+        #         return default
+        #     try:
+        #         return int(value)
+        #     except (ValueError, TypeError):
+        #         return default
+        #     except Exception as e:
+        #         print(f"Unexpected error converting to int: {e}")  # Log unexpected errors
+        #         return default
+        # def safe_convert_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+        #     """
+        #     Safely converts a value to a float, handling None and potential errors.
+
+        #     Args:
+        #         value: The value to convert.
+        #         default: The value to return if conversion fails or if value is None.
+
+        #     Returns:
+        #         The converted float, or the default if conversion fails or value is None.
+        #     """
+        #     if value is None:
+        #         return default
+        #     try:
+        #         return float(value)
+        #     except (ValueError, TypeError):
+        #         return default
+        #     except Exception as e:
+        #         print(f"Unexpected error converting to float: {e}")  # Log unexpected errors
+        #         return default
+        # def safe_convert_bool(value: Any, default: Optional[bool] = None) -> Optional[bool]:
+        #     """
+        #     Safely converts a value to a boolean, handling None and various representations.
+
+        #     Args:
+        #         value: The value to convert.
+        #         default: The value to return if conversion fails or if value is None.
+
+        #     Returns:
+        #         The converted boolean, or the default if conversion fails or value is None.
+        #     """
+        #     if value is None:
+        #         return default
+        #     if isinstance(value, (int, float)):
+        #         return bool(value)  # 0 -> False, non-zero -> True
+        #     elif isinstance(value, str):
+        #         if value.lower() in ("true", "1", "yes"):
+        #             return True
+        #         elif value.lower() in ("false", "0", "no"):
+        #             return False
+        #         else:
+        #             return default  # Return default for invalid strings
+        #     else:
+        #         try:
+        #             return bool(value)  # General boolean conversion
+        #         except (ValueError, TypeError):
+        #             return default
+        #         except Exception as e:
+        #             print(f"Unexpected error converting to bool: {e}")
+        #             return default
+        # def safe_parse_datetime(date_input: Union[str, datetime, date, pd.Timestamp]) -> Optional[datetime]:
+        #     """
+        #     Safely parses a string or datetime-like object into a datetime object.
+        #     Handles pd.NaT.
+        #     """
+        #     if date_input is None or pd.isna(date_input):
+        #         return None
+        #     if isinstance(date_input, datetime):
+        #         return date_input
+        #     if isinstance(date_input, date):
+        #         return datetime(date_input.year, date_input.month, date_input.day)
+        #     if isinstance(date_input, str):
+        #         formats = [
+        #             '%Y-%m-%d %H:%M:%S.%f',
+        #             '%Y-%m-%d %H:%M:%S',
+        #             '%Y-%m-%d',
+        #             '%d-%b-%Y',
+        #             '%d-%m-%Y %H:%M:%S',
+        #             '%d/%m/%Y',
+        #             '%m/%d/%Y',
+        #             '%Y/%m/%d',
+        #             '%Y%m%d',
+        #             '%d%m%Y'
+        #         ]
+        #         for fmt in formats:
+        #             try:
+        #                 return datetime.strptime(date_input, fmt)
+        #             except ValueError:
+        #                 pass  # Try the next format
+        #     return None
+
+        schema_fields: Dict[str, Type] = {
+            "instrument_key": str,
+            "Stock_Token": str,
+            "Instrument_Name": str,
+            "Exchange":str,
+            "Stock_Code": str,
+            "Product_Type": str,
+            "Expiry_Date": safe_parse_datetime,
+            "Option_Type": str,
+            "Strike_Price": safe_convert_float,
+            "Series": str,
+            "Ca_Level": str,
+            "Permitted_To_Trade": safe_convert_bool,  # Use safe_convert_bool
+            "Issue_Capital": safe_convert_float,    # Use safe_convert_float
+            "Warning_Qty": safe_convert_int,      # Use safe_convert_int
+            "Freeze_Qty": safe_convert_int,        # Use safe_convert_int
+            "Credit_Rating": str,
+            "Normal_Market_Status": str,
+            "Odd_Lot_Market_Status": str,
+            "Spot_Market_Status": str,
+            "Auction_Market_Status": str,
+            "Normal_Market_Eligibility": str,
+            "Odd_Lot_Market_Eligibility": str,
+            "Spot_Market_Eligibility": str,
+            "Auction_Market_Eligibility": str,
+            "Scrip_Id": str,
+            "Issue_Rate": safe_convert_float,    # Use safe_convert_float
+            "Issue_Start_Date": safe_parse_datetime,
+            "Interest_Payment_Date": safe_parse_datetime,
+            "Issue_Maturity_Date": safe_parse_datetime,
+            "Margin_Percentage": safe_convert_float,  # Use safe_convert_float
+            "Minimum_Lot_Qty": safe_convert_int,    # Use safe_convert_int
+            "Lot_Size": safe_convert_int,          # Use safe_convert_int
+            "Tick_Size": safe_convert_float,      # Use safe_convert_float
+            "Company_Name": str,
+            "Listing_Date": safe_parse_datetime,
+            "Expulsion_Date": safe_parse_datetime,
+            "Readmission_Date": safe_parse_datetime,
+            "Record_Date": safe_parse_datetime,
+            "Low_Price_Range": safe_convert_float,  # Use safe_convert_float
+            "High_Price_Range": safe_convert_float, # Use safe_convert_float
+            "Security_Expiry_Date": safe_parse_datetime,
+            "No_Delivery_Start_Date": safe_parse_datetime,
+            "No_Delivery_End_Date": safe_parse_datetime,
+            "Mf": str,
+            "Aon": str,
+            "Participant_In_Market_Index": str,
+            "Book_Cls_Start_Date": safe_parse_datetime,
+            "Book_Cls_End_Date": safe_parse_datetime,
+            "Excercise_Start_Date": safe_parse_datetime,
+            "Excercise_End_Date": safe_parse_datetime,
+            "Old_Token": str,
+            "Asset_Instrument": str,
+            "Asset_Name": str,
+            "Asset_Token": safe_convert_int,      # Use safe_convert_int
+            "Intrinsic_Value": safe_convert_float,  # Use safe_convert_float
+            "Extrinsic_Value": safe_convert_float,  # Use safe_convert_float
+            "Excercise_Style": str,
+            "Egm": str,
+            "Agm": str,
+            "Interest": str,
+            "Bonus": str,
+            "Rights": str,
+            "Dividends": str,
+            "Ex_Allowed": str,
+            "Ex_Rejection_Allowed": safe_convert_bool, # Use safe_convert_bool
+            "Pl_Allowed": safe_convert_bool,         # Use safe_convert_bool
+            "Is_This_Asset": safe_convert_bool,     # Use safe_convert_bool
+            "Is_Corp_Adjusted": safe_convert_bool,  # Use safe_convert_bool
+            "Local_Update_Datetime": safe_parse_datetime,
+            "Delete_Flag": safe_convert_bool,       # Use safe_convert_bool
+            "Remarks": str,
+            "Base_Price": safe_convert_float,      # Use safe_convert_float
+            "Exchange_Code": str,
+            "Refresh_Flag": safe_convert_bool,
+            "Breeze_Token": str,
+            "Kite_Token": str,
+        }
+
+        for schema_field, schema_type in schema_fields.items():
+            if schema_field in row:
+                if schema_type is str:
+                    processed_row[schema_field] = str(row[schema_field])
+                elif schema_type is int:
+                    processed_row[schema_field] = int(row[schema_field])
+                elif schema_type is float:
+                    processed_row[schema_field] = float(row[schema_field])
+                elif schema_type is bool:
+                    if isinstance(row[schema_field], (int, float)):
+                        processed_row[schema_field] = bool(row[schema_field])
+                    elif isinstance(row[schema_field], str):
+                        processed_row[schema_field] = row[schema_field].lower() in ("true", "1", "yes")
+                    else:
+                        processed_row[schema_field] = bool(row[schema_field])
+                elif schema_type is safe_parse_datetime:
+                    processed_row[schema_field] = safe_parse_datetime(row[schema_field])
+                else:
+                    processed_row[schema_field] = safe_convert(row[schema_field], schema_type)
+            else:
+                processed_row[schema_field] = None
+
+        return processed_row
+
+    async def get_symbol_token(self, instrument_key: str) -> str:
+        """
+        Retrieves the Breeze-specific token for a given instrument key.
+        """
+        try:
+            # Implement Breeze API call to get token
+            # Replace with your actual Breeze API call
+            token = self.broker.get_security_master(Stock_Code=instrument_key, Exchange_Code="NSE")  # or BSE.
+            token_value = token['Success'][0]['Token']
+            log_info(f"Breeze: Getting token for {instrument_key}")
+            # await asyncio.sleep(0.1) #dummy
+            # token = f"BREEZE_TOKEN_{instrument_key}"  # Dummy token
+            return token_value
+        except Exception as e:
+            log_exception(f"Breeze: Error getting symbol token for {instrument_key}: {e}")
+            raise
+
+    def get_iso_time(self,input_datetime: datetime) -> str:
+        """
+        Converts a string to an ISO 8601 formatted datetime string.
+        """
+        try:
+            # Parse the input datetime string to a datetime object
+            #dt_with_tz = datetime.fromisoformat(input_datetime)
+
+            # Convert to UTC
+            #dt_in_utc = dt_with_tz.astimezone(pytz.utc)
+
+            # Format the datetime object to ISO 8601 UTC format
+            output_datetime = input_datetime.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+
+            return output_datetime
+
+        except ValueError:
+            return None
+
+
+    def get_historical_data(self, data_request: historical_data_schema.HistoricalDataRequest) -> pd.DataFrame:
+        """
+        Fetches historical data from the Breeze API and returns a pandas DataFrame.
+        Handles partial datasets, removes duplicates, ensures proper datetime parsing,
+        and validates the index.
+        """
+        try:
+            # Parse and validate the date range
+            from_date = parser.isoparse(data_request.from_date)
+            to_date = parser.isoparse(data_request.to_date)
+            current_datetime = datetime.now().astimezone(ZoneInfo("Asia/Kolkata"))
+
+            if to_date > current_datetime:
+                log_warning(f"to_date {to_date} exceeds current datetime; restricting to {current_datetime}.")
+                to_date = current_datetime
+
+            if from_date >= to_date:
+                raise ValueError(f"from_date {from_date} is greater than to_date; Invalid Request.")
+
+            all_data = pd.DataFrame()
+            interval_offsets = {
+                "1second": pd.DateOffset(seconds=1),
+                "1minute": pd.DateOffset(minutes=1),
+                "5minute": pd.DateOffset(minutes=5),
+                "30minute": pd.DateOffset(minutes=30),
+                "1day": pd.DateOffset(days=1),
+            }
+
+            # Validate the interval
+            interval = data_request.interval or "1minute"
+            if interval not in interval_offsets:
+                raise ValueError(f"Invalid interval: {interval}. Allowable intervals: {list(interval_offsets.keys())}")
+
+            # Extract parameters from instrument_key
+            parts = data_request.instrument_key.split("@")
+            if len(parts) < 3:
+                raise ValueError("instrument_key is missing required parts.")
+
+            exchange = parts[0]
+            stock_code = parts[1]
+            product_type = parts[2]
+            expiry_date = parts[3] if len(parts) > 3 else None
+            right = parts[4] if len(parts) > 4 else None
+            strike_price = parts[5] if len(parts) > 5 else None
+
+            # Apply conditional logic based on product_type
+            if product_type == "equities":
+                expiry_date, right, strike_price = None, None, None
+            elif product_type == "futures":
+                right, strike_price = None, None
+            elif product_type == "options" and (not expiry_date or not right or not strike_price):
+                raise ValueError("Missing required parameters for options product type.")
+
+            current_date = from_date
+            while current_date < to_date:
+                to_date_chunk = min(to_date, current_date + interval_offsets[interval])
+                to_date_str = self.get_iso_time(to_date_chunk)
+
+                # Call the Breeze API
+                ret = self.broker.get_historical_data_v2(
+                    interval=interval,
+                    from_date=self.get_iso_time(current_date),
+                    to_date=to_date_str,
+                    stock_code=stock_code,
+                    exchange_code=exchange,
+                    product_type=product_type,
+                    expiry_date=expiry_date,
+                    right=right,
+                    strike_price=strike_price,
+                )
+
+                data = pd.DataFrame(ret.get("Success", []))
+                data["instrument_key"] = data_request.instrument_key
+                data["interval"] = data_request.interval
+                # Validate datetime column and parse it
+                if data.empty:
+                    # Log and terminate the loop when no more data is returned
+                    log_info(f"No data returned for the chunk from {current_date} to {to_date_chunk}. Terminating fetch.")
+                    break  # Exit the loop as there is no more data to fetch
+
+                data["datetime"] = pd.to_datetime(data["datetime"], errors="coerce", utc=True).dt.tz_convert("Asia/Kolkata")
+
+                # Drop rows with invalid datetime or duplicate records
+                data = data.dropna(subset=["datetime"])
+                data = data.drop_duplicates(subset=["datetime", "instrument_key", "interval"])
+
+                # Concatenate new data into all_data
+                all_data = pd.concat([all_data, data]).drop_duplicates(subset=["datetime", "instrument_key", "interval"])
+
+                # Update current_date for the next chunk
+                max_datetime = data["datetime"].max()
+                current_date = max_datetime + interval_offsets[interval]
+
+            # Post-process all_data
+            if not all_data.empty:
+                all_data.set_index("datetime", inplace=True)
+                all_data.index = pd.to_datetime(all_data.index, errors="coerce")
+                #all_data.index = all_data.index.tz_localize("Asia/Kolkata")
+
+                # Add additional columns for identification
+
+
+                # Convert DataFrame to a list of dictionaries for output
+                historical_data_list = all_data.reset_index().to_dict(orient="records")
+                return historical_data_list
+
+            return []  # Return an empty list if no data was fetched
+
+        except Exception as e:
+            log_exception(f"Error fetching historical data: {e}")
+            raise
+
+    def subscribe(self,instrument_key: str = None,broker_token: str = None,interval: str = '1second',get_market_depth: bool = False,get_exchange_quotes: bool = True):
+        """
+        Subscribes to real-time feeds for a given symbol.
+        Now takes instrument_key, broker_token and interval as input.
+        """
+        try:
+            # Check that at least one parameter is provided
+            if instrument_key is None and broker_token is None:
+                raise ValueError("Either 'instrument_key' or 'broker_token' must have a value. Both cannot be None.")
+            subscribe_dict={}
+            subscribe_dict['interval'] = interval
+            subscribe_dict['get_market_depth'] = get_market_depth
+            subscribe_dict['get_exchange_quotes'] =get_exchange_quotes
+
+            if instrument_key is not None:
+                parts = instrument_key.split("@")
+                if len(parts) < 3:
+                    raise ValueError("instrument_key is missing required parts.")
+                subscribe_dict['exchange_code'] = parts[0]
+                subscribe_dict['stock_code'] = parts[1]
+                subscribe_dict['product_type'] = parts[2]
+
+                if parts[2] == "futures":
+                    subscribe_dict['expiry_date'] = parts[3]
+
+                if parts[2] == "options" and (not parts[3] or not parts[4] or not parts[5]):
+                    subscribe_dict['expiry_date'] = parts[3]
+                    subscribe_dict['right'] = parts[4]
+                    subscribe_dict['strike_price'] = parts[5]
+                    raise ValueError("Missing required parameters for options product type.")
+                # Implement Breeze API subscription logic
+                self.broker.subscribe_feeds(**subscribe_dict)
+                log_info(f"Breeze: Subscribing to {instrument_key} with interval {interval}")
+            elif broker_token is not None:
+                subscribe_dict['stock_token'] = broker_token
+                self.broker.subscribe_feeds(**subscribe_dict)
+                log_info(f"Breeze: Subscribing to  token {broker_token} with interval {interval}")                
+        except Exception as e:
+            log_exception(f"Breeze: Error subscribing to {instrument_key}: {e}")
+            raise
+
+    def unsubscribe(self,instrument_key: str = None,broker_token: str = None):
+        """
+        unSubscribes to real-time feeds for a given symbol.
+        Now takes instrument_key, broker_token as input.
+        """
+        try:
+            # Check that at least one parameter is provided
+            if instrument_key is None and broker_token is None:
+                raise ValueError("Either 'instrument_key' or 'broker_token' must have a value. Both cannot be None.")
+            unsubscribe_dict={}
+            if instrument_key is not None:
+                parts = instrument_key.split("@")
+                if len(parts) < 3:
+                    raise ValueError("instrument_key is missing required parts.")
+                unsubscribe_dict['exchange_code'] = parts[0]
+                unsubscribe_dict['stock_code'] = parts[1]
+                unsubscribe_dict['product_type'] = parts[2]
+
+                if parts[2] == "futures":
+                    unsubscribe_dict['expiry_date'] = parts[3]
+
+                if parts[2] == "options" and (not parts[3] or not parts[4] or not parts[5]):
+                    unsubscribe_dict['expiry_date'] = parts[3]
+                    unsubscribe_dict['right'] = parts[4]
+                    unsubscribe_dict['strike_price'] = parts[5]
+                    raise ValueError("Missing required parameters for options product type.")
+                # Implement Breeze API subscription logic
+                self.broker.unsubscribe_feeds(**unsubscribe_dict)
+                log_info(f"Breeze: unsubscribing to {instrument_key}")
+            elif broker_token is not None:
+                unsubscribe_dict['stock_token'] = broker_token
+                self.broker.unsubscribe_feeds(**unsubscribe_dict)
+                log_info(f"Breeze: unsubscribing to  token {broker_token}")                
+        except Exception as e:
+            log_exception(f"Breeze: Error unsubscribing to {instrument_key}: {e}")
+            raise
+
+
+    async def process_feed(self, feed_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Processes real-time feed data.
+        Returns a dictionary, all datetimes are IST.
+        """
+        try:
+            exchange = str(feed_data.get("exchange", "UNKNOWN"))
+            stock_name = str(feed_data.get("stock_name", "UNKNOWN"))
+            product_type = str(feed_data.get("product_type", "UNKNOWN"))
+            expiry_date = str(feed_data.get("expiry_date", ""))
+            right = str(feed_data.get("right", ""))
+            strike_price = str(feed_data.get("strike_price", ""))
+
+            # Construct instrument key
+            instrument_key = f"{exchange}@{stock_name}@{product_type}"
+            if product_type.lower() == "futures" and expiry_date:
+                instrument_key += f"@{expiry_date}"
+            elif product_type.lower() == "options" and expiry_date and right and strike_price:
+                instrument_key += f"@{expiry_date}@{right}@{strike_price}"
+            # Standardized tick data, replacing None with appropriate defaults
+            processed_feed = {
+                "instrument_key": instrument_key,
+                "symbol": str(feed_data.get("symbol", "UNKNOWN")),
+                "open": float(feed_data.get("open", 0.0)),
+                "last": float(feed_data.get("last", 0.0)),
+                "high": float(feed_data.get("high", 0.0)),
+                "low": float(feed_data.get("low", 0.0)),
+                "change": float(feed_data.get("change", 0.0)),
+                "bPrice": float(feed_data.get("bPrice", 0.0)),
+                "bQty": int(feed_data.get("bQty", 0)),
+                "sPrice": float(feed_data.get("sPrice", 0.0)),
+                "sQty": int(feed_data.get("sQty", 0)),
+                "ltq": int(feed_data.get("ltq", 0)),
+                "avgPrice": float(feed_data.get("avgPrice", 0.0)),
+                "quotes": str(feed_data.get("quotes", "")),
+                "OI": int(feed_data.get("OI", 0)),
+                "CHNGOI": int(feed_data.get("CHNGOI", 0)),
+                "ttq": int(feed_data.get("ttq", 0)),
+                "totalBuyQt": int(feed_data.get("totalBuyQt", 0)),
+                "totalSellQ": int(feed_data.get("totalSellQ", 0)),
+                "ttv": str(feed_data.get("ttv", "")),
+                "trend": str(feed_data.get("trend", "")),
+                "lowerCktLm": float(feed_data.get("lowerCktLm", 0.0)),
+                "upperCktLm": float(feed_data.get("upperCktLm", 0.0)),
+                "ltt": str(feed_data.get("ltt", "1970-01-01T00:00:00+00:00")),  # Default time
+                "close": float(feed_data.get("close", 0.0)),
+                "exchange": exchange,
+                "stock_code": stock_name,
+                "product_type": product_type,
+                "expiry_date": expiry_date,
+                "strike_price": strike_price,
+                "right": right,
+                "state": "U",  # Unprocessed state
+                }
+            log_info(f"Breeze: Processed feed for {processed_feed['instrument_key']}")
+            return processed_feed
+        except Exception as e:
+            log_exception(f"Breeze: Error processing feed data: {e}")
+            raise
+
+    def _handle_tick_data_sync(self, tick_data: Dict[str, Any]):
+        """
+        Synchronous wrapper to call the async _handle_tick_data in a FastAPI-compatible way.
+        """
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.run_coroutine_threadsafe(self._handle_tick_data(tick_data), loop)
+            else:
+                log_exception("FastAPI event loop is not running. Tick processing may fail.")
+        except Exception as e:
+            log_exception(f"Breeze: Error in _handle_tick_data_sync: {e}")
+
+    async def _handle_tick_data(self, tick_data: Dict[str, Any]):
+        """
+        Asynchronous callback function to handle incoming tick data from the broker.
+        This should be as lightweight as possible.
+        """
+        try:
+            # 1. Standardize the tick data format
+            processed_feed = await self.process_feed(tick_data)
+
+            # 2. Add the processed feed to RedisService for batching
+            redis = self.app.state.connections.get("redis")  # Get the Redis connection from app state
+            if not hasattr(self, "redis_service"):
+                log_exception("RedisService is not initialized.")
+                return
+
+            await self.app.state.redis_service.add_tick(processed_feed)
+            log_info(f"Breeze: Tick data added to Redis batch - {processed_feed}")
+
+        except Exception as e:
+            log_exception(f"Breeze: Error handling tick data: {e}")
+
+    def _is_downloaded_today(self, filepath):
+        """
+        Checks if the file was downloaded today.
+        """
+        if not os.path.exists(filepath):
+            return False
+        return datetime.fromtimestamp(os.path.getmtime(filepath)).date() == datetime.now().date()
+
+    async def _download_file(self,url: str, target_dir: str) -> Optional[str]:
+        """
+        Downloads a file asynchronously.
+
+        Args:
+            url: The URL of the file to download.
+            target_dir: The directory to save the downloaded file to.
+
+        Returns:
+            The path to the downloaded file on success, None on failure.
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        filename = os.path.join(target_dir, os.path.basename(url))
+                        with open(filename, 'wb') as f:
+                            while True:
+                                chunk = await response.content.readany()
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+                        log_info(f"Downloaded {url} to {filename}")
+                        return filename
+                    else:
+                        log_exception(f"Failed to download {url}: {response.status}")
+                        return None  # Indicate failure
+        except aiohttp.ClientError as e:
+            log_exception(f"aiohttp client error downloading {url}: {e}")
+            return None
+        except Exception as e:
+            log_exception(f"Unexpected error downloading {url}: {e}")
+            return None
+
+    async def _extract_zip(self, zip_file_path, target_dir):
+        """
+        Extracts all files from a zip archive asynchronously.
+        """
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(self.executor, self._extract_zip_sync, zip_file_path, target_dir)
+        except Exception as e:
+            log_exception(f"Breeze: Error extracting zip file: {e}")
+            raise
+
+    def _extract_zip_sync(self, zip_file_path, target_dir):
+        """
+        Synchronously extracts all files from a zip archive.
+        """
+        with zipfile.ZipFile(zip_file_path, 'r') as zip_obj:
+            zip_obj.extractall(target_dir)
+
+    def _custom_date(self, date_input):
+        '''
+        custom date function
+        '''
+        if date_input is None:
+            return self._custom_date(datetime.now())
+        elif isinstance(date_input, datetime):
+            datetime_Z = date_input.replace(tzinfo=ZoneInfo('Asia/Kolkata')).astimezone(ZoneInfo('UTC'))
+            datetime_K = date_input.replace(tzinfo=ZoneInfo('Asia/Kolkata'))
+            datetime_N = date_input
+        elif isinstance(date_input, str):
+            try:
+                datetime_K = datetime.strptime(date_input, '%Y-%m-%d %H:%M:%S')
+                datetime_Z = datetime_K.replace(tzinfo=ZoneInfo('Asia/Kolkata')).astimezone(ZoneInfo('UTC'))
+                datetime_N = datetime_K
+            except ValueError:
+                try:
+                    datetime_K = datetime.strptime(date_input, '%Y-%m-%d')
+                    datetime_Z = datetime_K.replace(tzinfo=ZoneInfo('Asia/Kolkata')).astimezone(ZoneInfo('UTC'))
+                    datetime_N = datetime_K
+                except ValueError:
+                    datetime_Z = None
+                    datetime_K = None
+                    datetime_N = None
+        else:
+            datetime_Z = None
+            datetime_K = None
+            datetime_N = None
+
+        return type('obj', (object,), {'datetime_Z': datetime_Z, 'datetime_K': datetime_K, 'datetime': datetime_N})()
+    
+
+    async def simulate_ticks(self, interval: float = 1.0):
+        """
+        Simulates sending tick data at the specified interval.
+
+        Args:
+            interval: Time in seconds between each tick (default: 1 second).
+        """
+        try:
+            await asyncio.sleep(10) 
+            while True:
+                for instrument_key in self.instrument_keys:
+                    tick_data = self._generate_mock_tick(instrument_key)
+                    await self._handle_tick_data(tick_data)  # Call the callback
+                    log_info(f"Mock: Sent tick for {instrument_key}")
+                    self.tick_count += 1
+                    t.sleep(interval)  # Wait for the interval
+                if self.tick_count > 100:
+                    break
+        except Exception as e:
+            log_exception(f"MockBroker error: {e}")
+
+    def _generate_mock_tick(self, instrument_key: str) -> Dict[str, Any]:
+        """
+        Generates a mock tick data dictionary.
+        """
+        # Example data - customize this to your needs
+        exchange, stock_name, product_type, *rest = instrument_key.split("@")
+        expiry_date = rest[0] if len(rest) > 0 else None
+        option_type = rest[1] if len(rest) > 1 else None
+        strike_price = rest[2] if len(rest) > 2 else None
+
+        return {
+            "instrument_key": instrument_key,
+            "symbol": f"{stock_name}_{self.tick_count}",
+            "open": 100.0 + (self.tick_count % 10),
+            "high": 105.0 + (self.tick_count % 10),
+            "low": 95.0 + (self.tick_count % 10),
+            "close": 102.0 + (self.tick_count % 10),
+            "volume": 1000 + self.tick_count,
+            "ltt": "2025-02-12T12:12:55+05:30",  # Example IST
+            "exchange": exchange,
+            "stock_name": stock_name,
+            "product_type": product_type,
+            "expiry_date": expiry_date,
+            "strike_price": strike_price,
+            "right": option_type,
+            "oi": 100,
+            "change": 1.0,
+            "bPrice": 100.0,
+            "bQty": 100,
+            "sPrice": 101.0,
+            "sQty": 100,
+            "ttq": 100,
+            "avgPrice": 100.0,
+            "quotes": "mocked",
+            "CHNGOI": 100,
+            "totalBuyQt": 100,
+            "totalSellQ": 100,
+            "ttv": 100,
+            "trend": "up",
+            "lowerCktLm": 100.0,
+            "upperCktLm": 100.0
+        }
+C:\stocksblitz\ticker_service\app\core\config.py:
+
+from pydantic import BaseSettings
+import os
+
+class Settings(BaseSettings):
+    PROJECT_NAME: str = "Ticker Service"
+    API_V1_STR: str = "/api/v1"
+    postgres_user:str
+    postgres_password:str
+    postgres_host:str
+    postgres_port:int
+    postgres_database:str
+    postgres_host:str
+    rabbitmq_url:str
+    rabbitmq_host:str
+    rabbitmq_port:int
+    rabbitmq_user:str
+    rabbitmq_password:str
+    redis_host:str
+    redis_port:int
+    mongo_uri:str
+    mongo_user:str
+    mongo_password:str
+    mongo_host:str
+    mongo_port:int
+    mongo_database:str
+    BROKER_NAME: str
+    USER_NAME: str
+
+
+    class Config:
+        case_sensitive = True
+        env_file = ".env"  # Load environment variables from .env file
+
+C:\stocksblitz\ticker_service\app\core\dependencies.py:
+
+from fastapi import FastAPI,Depends,HTTPException
+from sqlalchemy.orm import Session
+from shared_architecture.utils.service_helpers import connection_manager
+from sqlalchemy.orm import Session
+from services import broker_service 
+from core.config import Settings
+def get_timescaledb_session():
+    """
+    Yields a TimescaleDB session from the ConnectionManager.
+    """
+    try:
+        db: Session = connection_manager.get_timescaledb_session()
+        yield db
+    finally:
+        if db:
+            db.close()
+
+def get_redis_client():
+    """
+    Yields a Redis client from the ConnectionManager.
+    """
+    redis_client = connection_manager.get_redis_connection()
+    try:
+        yield redis_client
+    finally:
+        if redis_client:
+            redis_client.close()
+
+def get_rabbitmq_connection():
+    """
+    Yields a RabbitMQ connection from the ConnectionManager.
+    """
+    rabbitmq_conn = connection_manager.get_rabbitmq_connection()
+    try:
+        yield rabbitmq_conn
+    finally:
+        if rabbitmq_conn:
+            rabbitmq_conn.close()
+
+def get_mongodb_client():
+    """
+    Yields a MongoDB client from the ConnectionManager.
+    """
+    mongodb_client = connection_manager.get_mongodb_connection()
+    try:
+        yield mongodb_client
+    finally:
+        if mongodb_client:
+            mongodb_client.close()
+
+
+
+def get_settings():
+    return Settings()
+
+def get_broker_instance(app: FastAPI):
+    """
+    Dependency to provide the initialized broker instance.
+    """
+    if hasattr(app.state, "broker_instance"):
+        return app.state.broker_instance
+    else:
+        raise HTTPException(status_code=500, detail="Broker instance not initialized in app.state")
+    
+def get_app():
+    """
+    Dependency to provide the FastAPI application instance.
+    """
+    from main import app  # Import app from main.py
+    return app
+C:\stocksblitz\ticker_service\app\core\security.py:
+
+C:\stocksblitz\ticker_service\app\core\__init__.py:
+
+C:\stocksblitz\ticker_service\app\models\historical_data.py:
+
+from sqlalchemy import Column, TIMESTAMP, Text, Double, BigInteger, Date
+from sqlalchemy.ext.declarative import declarative_base
+
+Base = declarative_base()
+
+class HistoricalData(Base):
+    __tablename__ = 'historical_data'
+    __table_args__ = {'schema': 'tradingdb'}
+    time = Column(TIMESTAMP(timezone=True), primary_key=True, nullable=False)  # Store with timezone
+    instrument_key = Column(Text, primary_key=True, nullable=False)
+    interval = Column(Text, primary_key=True, nullable=False)
+
+    open = Column(Double)
+    high = Column(Double)
+    low = Column(Double)
+    close = Column(Double)
+    volume = Column(BigInteger)
+    oi = Column(BigInteger)
+    expirydate = Column(Date)
+    option_type = Column(Text)
+    strikeprice = Column(Double)
+
+    # Greeks data columns
+    greeks_open_iv = Column(Double)
+    greeks_open_delta = Column(Double)
+    greeks_open_gamma = Column(Double)
+    greeks_open_theta = Column(Double)
+    greeks_open_rho = Column(Double)
+    greeks_open_vega = Column(Double)
+
+    greeks_high_iv = Column(Double)
+    greeks_high_delta = Column(Double)
+    greeks_high_gamma = Column(Double)
+    greeks_high_theta = Column(Double)
+    greeks_high_rho = Column(Double)
+    greeks_high_vega = Column(Double)
+
+    greeks_low_iv = Column(Double)
+    greeks_low_delta = Column(Double)
+    greeks_low_gamma = Column(Double)
+    greeks_low_theta = Column(Double)
+    greeks_low_rho = Column(Double)
+    greeks_low_vega = Column(Double)
+
+    greeks_close_iv = Column(Double)
+    greeks_close_delta = Column(Double)
+    greeks_close_gamma = Column(Double)
+    greeks_close_theta = Column(Double)
+    greeks_close_rho = Column(Double)
+    greeks_close_vega = Column(Double)
+C:\stocksblitz\ticker_service\app\models\symbol.py:
+
+from sqlalchemy import Column, String, Date, Float, Integer, Boolean, DateTime, UniqueConstraint
+from sqlalchemy.ext.declarative import declarative_base
+
+Base = declarative_base()
+
+class Symbol(Base):
+    __tablename__ = "symbols"
+    __table_args__ = {'schema': 'tradingdb'}
+
+    instrument_key = Column(String(255), primary_key=True, name='instrument_key')
+    Exchange = Column(String(50), name='Exchange')
+    Stock_Code = Column(String(50), name='Stock_Code')
+    Product_Type = Column(String(50), name='Product_Type')
+    Expiry_Date = Column(Date, name='Expiry_Date')
+    Option_Type = Column(String(50), name='Option_Type')
+    Strike_Price = Column(Float, name='Strike_Price')
+    Stock_Token = Column(String(255), name='Stock_Token')
+    Instrument_Name = Column(String(255), name='Instrument_Name')
+    Series = Column(String(50), name='Series')
+    Ca_Level = Column(String(50), name='Ca_Level')
+    Permitted_To_Trade = Column(Boolean, name='Permitted_To_Trade')
+    Issue_Capital = Column(Float, name='Issue_Capital')
+    Warning_Qty = Column(Integer, name='Warning_Qty')
+    Freeze_Qty = Column(Integer, name='Freeze_Qty')
+    Credit_Rating = Column(String(50), name='Credit_Rating')
+    Normal_Market_Status = Column(String(50), name='Normal_Market_Status')
+    Odd_Lot_Market_Status = Column(String(50), name='Odd_Lot_Market_Status')
+    Spot_Market_Status = Column(String(50), name='Spot_Market_Status')
+    Auction_Market_Status = Column(String(50), name='Auction_Market_Status')
+    Normal_Market_Eligibility = Column(String(50), name='Normal_Market_Eligibility')
+    Odd_Lot_Market_Eligibility = Column(String(50), name='Odd_Lot_Market_Eligibility')
+    Spot_Market_Eligibility = Column(String(50), name='Spot_Market_Eligibility')
+    Auction_Market_Eligibility = Column(String(50), name='Auction_Market_Eligibility')
+    Scrip_Id = Column(String(50), name='Scrip_Id')
+    Issue_Rate = Column(Float, name='Issue_Rate')
+    Issue_Start_Date = Column(Date, name='Issue_Start_Date')
+    Interest_Payment_Date = Column(Date, name='Interest_Payment_Date')
+    Issue_Maturity_Date = Column(Date, name='Issue_Maturity_Date')
+    Margin_Percentage = Column(Float, name='Margin_Percentage')
+    Minimum_Lot_Qty = Column(Integer, name='Minimum_Lot_Qty')
+    Lot_Size = Column(Integer, name='Lot_Size')
+    Tick_Size = Column(Float, name='Tick_Size')
+    Company_Name = Column(String(255), name='Company_Name')
+    Listing_Date = Column(Date, name='Listing_Date')
+    Expulsion_Date = Column(Date, name='Expulsion_Date')
+    Readmission_Date = Column(Date, name='Readmission_Date')
+    Record_Date = Column(Date, name='Record_Date')
+    Low_Price_Range = Column(Float, name='Low_Price_Range')
+    High_Price_Range = Column(Float, name='High_Price_Range')
+    Security_Expiry_Date = Column(Date, name='Security_Expiry_Date')
+    No_Delivery_Start_Date = Column(Date, name='No_Delivery_Start_Date')
+    No_Delivery_End_Date = Column(Date, name='No_Delivery_End_Date')
+    Mf = Column(String(50), name='Mf')
+    Aon = Column(String(50), name='Aon')
+    Participant_In_Market_Index = Column(String(50), name='Participant_In_Market_Index')
+    Book_Cls_Start_Date = Column(Date, name='Book_Cls_Start_Date')
+    Book_Cls_End_Date = Column(Date, name='Book_Cls_End_Date')
+    Excercise_Start_Date = Column(Date, name='Excercise_Start_Date')
+    Excercise_End_Date = Column(Date, name='Excercise_End_Date')
+    Old_Token = Column(String(255), name='Old_Token')
+    Asset_Instrument = Column(String(255), name='Asset_Instrument')
+    Asset_Name = Column(String(255), name='Asset_Name')
+    Asset_Token = Column(Integer, name='Asset_Token')
+    Intrinsic_Value = Column(Float, name='Intrinsic_Value')
+    Extrinsic_Value = Column(Float, name='Extrinsic_Value')
+    Excercise_Style = Column(String(50), name='Excercise_Style')
+    Egm = Column(String(50), name='Egm')
+    Agm = Column(String(50), name='Agm')
+    Interest = Column(String(50), name='Interest')
+    Bonus = Column(String(50), name='Bonus')
+    Rights = Column(String(50), name='Rights')
+    Dividends = Column(String(50), name='Dividends')
+    Ex_Allowed = Column(String(50), name='Ex_Allowed')
+    Ex_Rejection_Allowed = Column(Boolean, name='Ex_Rejection_Allowed')
+    Pl_Allowed = Column(Boolean, name='Pl_Allowed')
+    Is_This_Asset = Column(Boolean, name='Is_This_Asset')
+    Board_Lot_Qty= Column(Integer, name='Board_Lot_Qty')
+    Date_Of_Delisting= Column(Date, name='Date_Of_Delisting')
+    Date_Of_Listing= Column(Date, name='Date_Of_Listing')
+    Face_Value = Column(Float, name='Face_Value')
+    Freeze_Percent = Column(Float, name='Freeze_Percent')
+    High_Date= Column(Date, name='High_Date')
+    ISIN_Code= Column(String(50), name='ISIN_Code')
+    Instrument_Type= Column(String(50), name='Instrument_Type')
+    Issue_Price = Column(Float, name='Issue_Price')
+    Life_Time_High = Column(Float, name='Life_Time_High')
+    Life_Time_Low = Column(Float, name='Life_Time_Low')
+    Low_Date= Column(Date, name='Low_Date')
+    AVM_Buy_Margin= Column(Float, name='AVM_Buy_Margin')
+    AVM_Sell_Margin = Column(Float, name='AVM_Sell_Margin')
+    BCast_Flag= Column(Boolean, name='BCast_Flag')
+    Group_Name = Column(String(50), name='Group_Name')
+    Market_Lot= Column(Integer, name='Market_Lot')
+    NDE_Date= Column(Date, name='NDE_Date')
+    NDS_Date= Column(Date, name='NDS_Date')
+    Nd_Flag= Column(Boolean, name='Nd_Flag')
+    Scrip_Code = Column(String(255), name='Scrip_Code')
+    Scrip_Name = Column(String(255), name='Scrip_Name')
+    Susp_Status = Column(String(255), name='Susp_Status')
+    Suspension_Reason = Column(String(255), name='Suspension_Reason')
+    Suspension_Date= Column(Date, name='Suspension_Date')
+    Is_Corp_Adjusted = Column(Boolean, name='Is_Corp_Adjusted')
+    Local_Update_Datetime = Column(DateTime, name='Local_Update_Datetime')
+    Delete_Flag = Column(Boolean, name='Delete_Flag')
+    Remarks = Column(String(255), name='Remarks')
+    Base_Price = Column(Float, name='Base_Price')
+    Exchange_Code = Column(String(50), name='Exchange_Code')
+    Product_Type = Column(String(50), name='Product_Type')
+    Refresh_Flag = Column(Boolean, name='Refresh_Flag')
+    Breeze_Token = Column(String(255), name='Breeze_Token')
+    Kite_Token = Column(String(255), name='Kite_Token')
+    first_added_datetime= Column(Date, name='first_added_datetime')
+    __table_args__ = (UniqueConstraint('instrument_key'),)
+C:\stocksblitz\ticker_service\app\models\tick_data.py:
+
+from sqlalchemy import Column, TIMESTAMP, Text, Double, BigInteger, Date
+from sqlalchemy.ext.declarative import declarative_base
+
+Base = declarative_base()
+
+class TickData(Base):
+    __tablename__ = 'tick_data'
+    __table_args__ = {'schema': 'tradingdb'}
+    time = Column(TIMESTAMP(timezone=True), primary_key=True, nullable=False)  # Store with timezone
+    instrument_key = Column(Text, primary_key=True, nullable=False)
+    interval = Column(Text, primary_key=True, nullable=False)
+
+    open = Column(Double)
+    high = Column(Double)
+    low = Column(Double)
+    close = Column(Double)
+    volume = Column(BigInteger)
+    oi = Column(BigInteger)
+    expirydate = Column(Date)
+    option_type = Column(Text)
+    strikeprice = Column(Double)
+
+    # Greeks data columns
+    greeks_open_iv = Column(Double)
+    greeks_open_delta = Column(Double)
+    greeks_open_gamma = Column(Double)
+    greeks_open_theta = Column(Double)
+    greeks_open_rho = Column(Double)
+    greeks_open_vega = Column(Double)
+
+    greeks_high_iv = Column(Double)
+    greeks_high_delta = Column(Double)
+    greeks_high_gamma = Column(Double)
+    greeks_high_theta = Column(Double)
+    greeks_high_rho = Column(Double)
+    greeks_high_vega = Column(Double)
+
+    greeks_low_iv = Column(Double)
+    greeks_low_delta = Column(Double)
+    greeks_low_gamma = Column(Double)
+    greeks_low_theta = Column(Double)
+    greeks_low_rho = Column(Double)
+    greeks_low_vega = Column(Double)
+
+    greeks_close_iv = Column(Double)
+    greeks_close_delta = Column(Double)
+    greeks_close_gamma = Column(Double)
+    greeks_close_theta = Column(Double)
+    greeks_close_rho = Column(Double)
+    greeks_close_vega = Column(Double)
+C:\stocksblitz\ticker_service\app\models\__init__.py:
+
+from shared_architecture.db.models.broker import Broker
+from models.historical_data import HistoricalData
+from models.symbol import Symbol
+from models.tick_data import TickData
+C:\stocksblitz\ticker_service\app\schemas\feed.py:
+
+from pydantic import BaseModel
+from typing import Optional
+
+class FeedBase(BaseModel):
+    instrument_key: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+    oi: Optional[int] = None
+    expirydate: Optional[str] = None
+    option_type: Optional[str] = None
+    strikeprice: Optional[float] = None
+
+class FeedCreate(FeedBase):
+    pass
+
+class Feed(FeedBase):
+    time: str
+
+    class Config:
+        orm_mode = True
+C:\stocksblitz\ticker_service\app\schemas\historical_data.py:
+
+from pydantic import BaseModel
+from datetime import date, datetime
+from typing import Optional
+
+class HistoricalDataRequest(BaseModel):
+    instrument_key: str
+    from_date: str
+    to_date: str
+    interval: str
+    sort: Optional[str] = 'desc'  # Optional field with default value
+
+class HistoricalDataCreate(BaseModel):
+    instrument_key: str
+    time: datetime
+    interval: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+    oi: Optional[int] = None
+    expirydate: Optional[date] = None
+    option_type: Optional[str] = None
+    strikeprice: Optional[float] = None
+    greeks_open_iv: Optional[float] = None
+    greeks_open_delta: Optional[float] = None
+    greeks_open_gamma: Optional[float] = None
+    greeks_open_theta: Optional[float] = None
+    greeks_open_rho: Optional[float] = None
+    greeks_open_vega: Optional[float] = None
+    greeks_high_iv: Optional[float] = None
+    greeks_high_delta: Optional[float] = None
+    greeks_high_gamma: Optional[float] = None
+    greeks_high_theta: Optional[float] = None
+    greeks_high_rho: Optional[float] = None
+    greeks_high_vega: Optional[float] = None
+    greeks_low_iv: Optional[float] = None
+    greeks_low_delta: Optional[float] = None
+    greeks_low_gamma: Optional[float] = None
+    greeks_low_theta: Optional[float] = None
+    greeks_low_rho: Optional[float] = None
+    greeks_low_vega: Optional[float] = None
+    greeks_close_iv: Optional[float] = None
+    greeks_close_delta: Optional[float] = None
+    greeks_close_gamma: Optional[float] = None
+    greeks_close_theta: Optional[float] = None
+    greeks_close_rho: Optional[float] = None
+    greeks_close_vega: Optional[float] = None
+
+class HistoricalData(HistoricalDataCreate):
+    id: int
+
+    class Config:
+        orm_mode = True
+C:\stocksblitz\ticker_service\app\schemas\subscription.py:
+
+from pydantic import BaseModel
+
+class SubscriptionCreate(BaseModel):
+    instrument_key: str
+
+class Subscription(SubscriptionCreate):
+    # No extra fields needed for now
+    pass
+C:\stocksblitz\ticker_service\app\schemas\symbol.py:
+
+from pydantic import BaseModel, Field
+from typing import Optional
+from datetime import date, datetime
+
+class SymbolBase(BaseModel):
+    instrument_key: str = Field(max_length=255)
+    Exchange: str = Field(max_length=50)
+    Stock_Code: str
+    Product_Type: Optional[str] = Field(None, max_length=50)
+    Expiry_Date: Optional[date] = None
+    Option_Type: Optional[str] = Field(None, max_length=50)
+    Strike_Price: Optional[float] = None
+    Stock_Token: str
+    Instrument_Name: Optional[str] = Field(None, max_length=255)
+    Series: Optional[str] = Field(None, max_length=50)
+    Ca_Level: Optional[str] = Field(None, max_length=50)
+    Permitted_To_Trade: Optional[bool] = None
+    Issue_Capital: Optional[float] = None
+    Warning_Qty: Optional[int] = None
+    Freeze_Qty: Optional[int] = None
+    Credit_Rating: Optional[str] = Field(None, max_length=50)
+    Normal_Market_Status: Optional[str] = Field(None, max_length=50)
+    Odd_Lot_Market_Status: Optional[str] = Field(None, max_length=50)
+    Spot_Market_Status: Optional[str] = Field(None, max_length=50)
+    Auction_Market_Status: Optional[str] = Field(None, max_length=50)
+    Normal_Market_Eligibility: Optional[str] = Field(None, max_length=50)
+    Odd_Lot_Market_Eligibility: Optional[str] = Field(None, max_length=50)
+    Spot_Market_Eligibility: Optional[str] = Field(None, max_length=50)
+    Auction_Market_Eligibility: Optional[str] = Field(None, max_length=50)
+    Scrip_Id: Optional[str] = Field(None, max_length=50)
+    Issue_Rate: Optional[float] = None
+    Issue_Start_Date: Optional[date] = None
+    Interest_Payment_Date: Optional[date] = None
+    Issue_Maturity_Date: Optional[date] = None
+    Margin_Percentage: Optional[float] = None
+    Minimum_Lot_Qty: Optional[int] = None
+    Lot_Size: Optional[int] = None
+    Tick_Size: Optional[float] = None
+    Company_Name: Optional[str] = Field(None, max_length=255)
+    Board_Lot_Qty: Optional[int] = None
+    Date_Of_Delisting: Optional[int] = None
+    Date_Of_Listing: Optional[date] = None
+    Face_Value: Optional[float] = None
+    Freeze_Percent: Optional[float] = None  
+    High_Date: Optional[date] = None
+    ISIN_Code: Optional[str] = Field(None, max_length=50)
+    Instrument_Type: Optional[str] = Field(None, max_length=50)
+    Issue_Price: Optional[float] = None
+    Life_Time_High: Optional[float] = None
+    Life_Time_Low: Optional[float] = None
+    Low_Date: Optional[date] = None
+    AVM_Buy_Margin: Optional[float] = None
+    AVM_Sell_Margin: Optional[float] = None
+    BCast_Flag: Optional[bool] = None
+    Group_Name: Optional[str] = Field(None, max_length=50)
+    Market_Lot: Optional[int] = None
+    NDE_Date: Optional[date] = None
+    NDS_Date: Optional[date] = None
+    Nd_Flag: Optional[bool] = None
+    Scrip_Code: Optional[str] = Field(None, max_length=50)
+    Scrip_Name: Optional[str] = Field(None, max_length=50)
+    Susp_Status: Optional[str] = Field(None, max_length=50)
+    Suspension_Reason: Optional[str] = Field(None, max_length=255)
+    Suspension_Date: Optional[date] = None
+    Listing_Date: Optional[date] = None
+    Expulsion_Date: Optional[date] = None
+    Readmission_Date: Optional[date] = None
+    Record_Date: Optional[date] = None
+    Low_Price_Range: Optional[float] = None
+    High_Price_Range: Optional[float] = None
+    Security_Expiry_Date: Optional[date] = None
+    No_Delivery_Start_Date: Optional[date] = None
+    No_Delivery_End_Date: Optional[date] = None
+    Mf: Optional[str] = Field(None, max_length=50)
+    Aon: Optional[str] = Field(None, max_length=50)
+    Participant_In_Market_Index: Optional[str] = Field(None, max_length=50)
+    Book_Cls_Start_Date: Optional[date] = None
+    Book_Cls_End_Date: Optional[date] = None
+    Excercise_Start_Date: Optional[date] = None
+    Excercise_End_Date: Optional[date] = None
+    Old_Token: Optional[str] = Field(None, max_length=255)
+    Asset_Instrument: Optional[str] = Field(None, max_length=255)
+    Asset_Name: Optional[str] = Field(None, max_length=255)
+    Asset_Token: Optional[int] = None
+    Intrinsic_Value: Optional[float] = None
+    Extrinsic_Value: Optional[float] = None
+    Excercise_Style: Optional[str] = Field(None, max_length=50)
+    Egm: Optional[str] = Field(None, max_length=50)
+    Agm: Optional[str] = Field(None, max_length=50)
+    Interest: Optional[str] = Field(None, max_length=50)
+    Bonus: Optional[str] = Field(None, max_length=50)
+    Rights: Optional[str] = Field(None, max_length=50)
+    Dividends: Optional[str] = Field(None, max_length=50)
+    Ex_Allowed: Optional[str] = Field(None, max_length=50)
+    Ex_Rejection_Allowed: Optional[bool] = None
+    Pl_Allowed: Optional[bool] = None
+    Is_This_Asset: Optional[bool] = None
+    Is_Corp_Adjusted: Optional[bool] = None
+    Local_Update_Datetime: Optional[datetime] = None
+    Delete_Flag: Optional[bool] = None
+    Remarks: Optional[str] = Field(None, max_length=255)
+    Base_Price: Optional[float] = None
+    Exchange_Code: Optional[str] = Field(None, max_length=50)
+    Breeze_Token: Optional[str] = Field(None, max_length=255)
+    Kite_Token: Optional[str] = Field(None, max_length=255)
+    first_added_datetime: Optional[date] = None
+    
+class SymbolCreate(SymbolBase):
+    pass
+
+class SymbolUpdate(SymbolBase):
+    pass
+
+class Symbol(SymbolBase):
+    id: int
+
+    class Config:
+        orm_mode = True
+C:\stocksblitz\ticker_service\app\schemas\__init__.py:
+
+C:\stocksblitz\ticker_service\app\services\broker_service.py:
+
+import os
+import importlib
+import datetime
+import logging
+import psycopg2  # Third-party library, but often closely related to DB
+
+from typing import List, Dict, Any,Callable
+
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from core.config import Settings
+from schemas import historical_data as historical_data_schema, feed as feed_schema
+from models import tick_data as tick_data_model
+from services import rabbitmq_service
+from shared_architecture.db.models import broker as broker_model
+
+broker_instance = None  # Global variable to store the broker instance
+async def get_broker_details(db: Session, settings: Settings) -> broker_model.Broker:
+    """
+    Retrieves broker details from TimescaleDB based on broker_name and username.
+    """
+#try:
+
+    broker = db.query(broker_model.Broker).filter(
+         broker_model.Broker.broker_name == settings.BROKER_NAME,
+         broker_model.Broker.username == settings.USER_NAME
+     ).all()  # Explicit schema in query
+    if not broker:
+         raise HTTPException(status_code=404, detail="Broker details not found")
+    return broker
+async def get_broker_module(broker_name: str):
+    """
+    Dynamically imports the broker-specific module.
+    """
+    try:
+        module_name = f"brokers.{broker_name.lower()}"  # Assuming broker modules are in app/brokers/
+        broker_module = importlib.import_module(module_name)
+        return broker_module
+    except ImportError as e:
+        log_exception(f"Failed to import broker module {broker_name}: {e}")
+        raise HTTPException(status_code=500, detail=f"Broker module import failed: {e}")
+
+async def initialize_broker(broker: broker_model.Broker):
+    """
+    Initializes the broker module and creates an instance.
+    """
+    global broker_instance
+    try:
+        broker_module = await get_broker_module(broker.broker_name)
+        broker_instance = broker_module.Broker(broker)
+        log_info(f"Broker {broker.broker_name} initialized.")
+        return broker_instance
+    except ImportError as e:
+        log_exception(f"Failed to import broker module {broker.broker_name}: {e}")
+        raise HTTPException(status_code=500, detail=f"Broker module import failed: {e}")
+    except Exception as e:
+        log_exception(f"Failed to initialize broker {broker.broker_name}: {e}")
+        raise HTTPException(status_code=500, detail=f"Broker initialization failed: {e}")
+
+async def shutdown_broker():
+    """
+    Shuts down the broker connection.
+    """
+    global broker_instance
+    if broker_instance:
+        try:
+            await broker_instance.disconnect()
+            log_info("Broker connection closed.")
+        except Exception as e:
+            log_exception(f"Failed to disconnect broker: {e}")
+
+async def fetch_historical_data(broker: broker_model.Broker, data_request: historical_data_schema.HistoricalDataRequest) -> List[Dict[str, Any]]:
+    """
+    Fetches historical data from the broker API.
+    Returns a list of dictionaries.
+    """
+    global broker_instance
+    if not broker_instance:
+        raise HTTPException(status_code=500, detail="Broker not initialized")
+    fetched_data = await broker_instance.get_historical_data(data_request)
+    return fetched_data
+
+async def subscribe_to_symbol(broker: broker_model.Broker, instrument_key: str, broker_token: str, interval: str = '1second', get_market_depth: bool = False, get_exchange_quotes: bool = True):
+    """
+    Subscribes to a symbol for real-time feeds.
+    Now takes broker_token and interval as input.
+    """
+    global broker_instance
+    if not broker_instance:
+        raise HTTPException(status_code=500, detail="Broker not initialized")
+    await broker_instance.subscribe(instrument_key, broker_token, interval, get_market_depth, get_exchange_quotes)
+
+async def unsubscribe_from_symbol(broker: broker_model.Broker, instrument_key: str, broker_token: str, interval: str = '1second'):
+    """
+    Unsubscribes from a symbol.
+    Now takes broker_token and interval as input.
+    """
+    global broker_instance
+    if not broker_instance:
+        raise HTTPException(status_code=500, detail="Broker not initialized")
+    await broker_instance.unsubscribe(instrument_key, broker_token, interval)
+
+async def process_realtime_feed(db: Session, broker: broker_model.Broker, feed_data: Dict[str, Any]):
+    """
+    Processes real-time feed data, stores it in TickData, and publishes to RabbitMQ.
+    """
+    global broker_instance
+    if not broker_instance:
+        raise HTTPException(status_code=500, detail="Broker not initialized")
+    try:
+        # Call broker module to process the feed data
+        processed_feed_data = await broker_instance.process_feed(feed_data)
+
+        # Convert the processed data to TickData model
+        feed = feed_schema.FeedCreate(**processed_feed_data)
+
+        # Map the feed data to the TickData model
+        tick_data_record = tick_data_model.TickData(
+            time=processed_feed_data.get("timestamp"),  # Use timestamp from processed data
+            instrument_key=feed.instrument_key,
+            interval="1T",  # Default. replace if needed.
+            open=feed.open,
+            high=feed.high,
+            low=feed.low,
+            close=feed.close,
+            volume=feed.volume,
+            oi=processed_feed_data.get("OI"),  # Map OI
+            expirydate=processed_feed_data.get("expiry_date"),  # Map expiry_date
+            option_type=processed_feed_data.get("right"),  # Map option_type
+            strikeprice=processed_feed_data.get("strike_price"),  # Map strike_price
+            greeks_open_iv=None,  # Not available in sample
+            greeks_open_delta=None,  # Not available in sample
+            greeks_open_gamma=None,  # Not available in sample
+            greeks_open_theta=None,  # Not available in sample
+            greeks_open_rho=None,  # Not available in sample
+            greeks_open_vega=None,  # Not available in sample
+            greeks_high_iv=None,  # Not available in sample
+            greeks_high_delta=None,  # Not available in sample
+            greeks_high_gamma=None,  # Not available in sample
+            greeks_high_theta=None,  # Not available in sample
+            greeks_high_rho=None,  # Not available in sample
+            greeks_high_vega=None,  # Not available in sample
+            greeks_low_iv=None,  # Not available in sample
+            greeks_low_delta=None,  # Not available in sample
+            greeks_low_gamma=None,  # Not available in sample
+            greeks_low_theta=None,  # Not available in sample
+            greeks_low_rho=None,  # Not available in sample
+            greeks_low_vega=None,  # Not available in sample
+            greeks_close_iv=None,  # Not available in sample
+            greeks_close_delta=None,  # Not available in sample
+            greeks_close_gamma=None,  # Not available in sample
+            greeks_close_theta=None,  # Not available in sample
+            greeks_close_rho=None,  # Not available in sample
+            greeks_close_vega=None,  # Not available in sample
+        )
+
+        db.add(tick_data_record)
+        db.commit()
+        db.refresh(tick_data_record)
+
+        # Publish to RabbitMQ
+        # Ensure that feed.dict() is used here, not processed_feed_data
+        await rabbitmq_service.publish_tick_data(feed.dict())
+
+    except Exception as e:
+        log_exception(f"Error processing real-time feed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+C:\stocksblitz\ticker_service\app\services\rabbitmq_service.py:
+
+import asyncio
+import json
+import logging
+import aio_pika
+from core.config import Settings
+from fastapi import FastAPI,Depends
+from sqlalchemy.orm import Session
+from core.dependencies import get_app
+from typing import List,Dict,Any
+
+async def publish_tick_data(feed_data: dict):
+    """
+    Publishes tick data to RabbitMQ with routing based on instrument_key.
+
+    Args:
+        feed_data (dict): The tick data dictionary.
+    """
+    try:
+        app=get_app()
+        connection: aio_pika.Connection = await aio_pika.connect_robust(app.state.settings.rabbitmq_url)  # Adjust URL
+        # Establish an asynchronous connection to RabbitMQ
+        #connection=app.state.connections
+        #aio_pika.Connection = await aio_pika.connect_robust(settings.RABBITMQ_URL)  # Adjust URL
+
+        async with connection:
+            # Create an asynchronous channel
+            channel: aio_pika.Channel = await connection.channel()
+
+            # Declare the exchange (ensure this matches your RabbitMQ setup)
+            exchange_name = "tick_exchange"  # Replace with your exchange name
+            exchange: aio_pika.Exchange = await channel.declare_exchange(
+                exchange_name, aio_pika.ExchangeType.DIRECT
+            )
+
+            # Extract routing key (instrument_key)
+            routing_key = feed_data.get("instrument_key")
+            if not routing_key:
+                log_exception("Missing instrument_key in feed data. Cannot route message.")
+                return
+
+            message = aio_pika.Message(
+                body=json.dumps(feed_data).encode(),
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT  # Ensure messages survive restarts
+            )
+
+            # Publish the message
+            await exchange.publish(message, routing_key=routing_key)
+            log_info(f"Published tick data for {routing_key} to RabbitMQ")
+
+    except aio_pika.exceptions.AMQPConnectionError as e:
+        log_exception(f"RabbitMQ connection error: {e}")
+        # Handle connection errors (e.g., retry, raise exception)
+    except Exception as e:
+        log_exception(f"Error publishing to RabbitMQ: {e}")
+        # Handle other exceptions
+        # Handle other exceptions
+async def publish_tick_batch(tick_batch: List[Dict[str, Any]]):
+    """
+    Publishes a batch of tick data to RabbitMQ in bulk.
+    """
+    try:
+        app = get_app()  # Retrieve the FastAPI app instance
+        connection: aio_pika.Connection = await aio_pika.connect_robust(app.state.settings.rabbitmq_url)
+
+        async with connection:
+            # Create an asynchronous channel
+            channel: aio_pika.Channel = await connection.channel()
+
+            # Declare the exchange (ensure it matches your RabbitMQ setup)
+            exchange_name = "tick_exchange"
+            exchange: aio_pika.Exchange = await channel.declare_exchange(
+                exchange_name, aio_pika.ExchangeType.DIRECT
+            )
+
+            # Prepare the messages for batch publishing
+            messages = []
+            for tick_data in tick_batch:
+                routing_key = tick_data.get("instrument_key")
+                if not routing_key:
+                    log_exception("Missing instrument_key in tick data. Cannot route message.")
+                    continue
+
+                message = aio_pika.Message(
+                    body=json.dumps(tick_data).encode(),
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT
+                )
+                messages.append((message, routing_key))
+
+            # Publish messages in bulk
+            for message, routing_key in messages:
+                await exchange.publish(message, routing_key=routing_key)
+
+            log_info(f"Published {len(messages)} tick data entries to RabbitMQ")
+
+    except aio_pika.exceptions.AMQPConnectionError as e:
+        log_exception(f"RabbitMQ connection error: {e}")
+    except Exception as e:
+        log_exception(f"Error publishing tick batch to RabbitMQ: {e}")
+# async def process_tick_queue(db: Session, broker_instance):
+#     """
+#     Consumes tick data from the broker's queue, processes it, and stores it.
+#     """
+#     try:
+#         while True:
+#             feed_data = await broker_instance.tick_queue.get()
+#             # Process the feed data (e.g., moneyness calculation)
+#             # ... your processing logic ...
+
+#             # Store in TimescaleDB (asyncpg)
+#             await timescaledb_service.create_tick_data(db, feed_data)
+
+#             # Publish to RabbitMQ (if needed)
+#             await publish_tick_data(feed_data)
+
+#             broker_instance.tick_queue.task_done()
+
+#     except Exception as e:
+#         log_exception(f"Error processing tick queue: {e}")
+
+
+# async def start_tick_processing(app: FastAPI, db: Session, broker_instance):
+#     """
+#     Starts the tick data processing task.
+#     """
+#     asyncio.create_task(process_tick_queue(app.state.broker_instance, db))
+C:\stocksblitz\ticker_service\app\services\redis.py:
+
+import os
+import logging
+from redis.asyncio import Redis
+
+# Logging Configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+# Redis Configuration
+REDIS_HOST = os.getenv("SHARED_REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("SHARED_REDIS_PORT", 6379))
+REDIS_DB = int(os.getenv("SHARED_REDIS_DB", 0))
+REDIS_MAX_CONNECTIONS = int(os.getenv("SHARED_REDIS_MAX_CONNECTIONS", 10))
+
+async def connect_to_redis():
+    """
+    Asynchronously connect to Redis and test the connection.
+
+    Returns:
+        redis.asyncio.Redis: Async Redis connection object if successful.
+    """
+    try:
+        # Build Redis connection
+        redis_client = Redis.from_url(
+            f"redis://{REDIS_HOST}:{REDIS_PORT}",
+            db=REDIS_DB,
+            decode_responses=True,  # Return strings instead of bytes
+            max_connections=REDIS_MAX_CONNECTIONS,
+        )
+
+        # Test the connection
+        await redis_client.ping()
+        log_info("Redis async connection successful!")
+        return redis_client
+
+    except Exception as e:
+        log_exception(f"Error connecting to Redis asynchronously: {e}")
+        return None
+
+async def close_redis_connection(redis_client):
+    """
+    Closes the Redis connection gracefully.
+
+    Args:
+        redis_client (redis.asyncio.Redis): The Redis connection to close.
+    """
+    if redis_client:
+        try:
+            await redis_client.close()
+            log_info("Redis async connection closed successfully.")
+        except Exception as e:
+            log_exception(f"Error closing Redis connection: {e}")
+C:\stocksblitz\ticker_service\app\services\redis_service.py:
+
+import logging
+import json
+import asyncio
+from redis.asyncio import Redis
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+
+class RedisService:
+    def __init__(self, redis, batch_size=10, batch_timeout=1.0, failure_queue="failure_queue"):
+        self.redis = redis
+        self.batch_size = batch_size
+        self.batch_timeout = batch_timeout
+        self.buffer = []  # Buffer for batching
+        self.buffer_lock = asyncio.Lock()  # Lock for synchronizing the buffer
+        self.failure_queue = failure_queue
+    async def add_tick(self, tick_data):
+        """
+        Adds a single tick to the buffer for batching.
+        """
+        async with self.buffer_lock:
+            self.buffer.append(tick_data)
+            if len(self.buffer) >= self.batch_size:
+                await self._process_batch()
+
+    async def _process_batch(self):
+        """
+        Processes the current buffer of ticks into Redis using pipelining.
+        This is intended to be a private method.
+        """
+        async with self.buffer_lock:
+            if not self.buffer:
+                return  # No ticks to process
+
+            tick_batch = self.buffer
+            self.buffer = []  # Clear the buffer immediately
+
+        try:
+            async with self.redis.pipeline() as pipe:
+                for tick_data in tick_batch:
+                    tick_data_cleaned = {k: str(v) for k, v in tick_data.items()}
+                    stream_name = f"tick_stream:{tick_data_cleaned['exchange']}@{tick_data_cleaned['stock_code']}"
+                    pipe.xadd(stream_name, tick_data_cleaned)
+
+                await pipe.execute()
+                log_info(f"Pushed {len(tick_batch)} ticks to Redis.")
+        except Exception as e:
+            log_exception(f"Failed to push batch ticks to Redis: {e}")
+
+    async def run_batch_processor(self):
+        """
+        Continuously flushes the buffer at regular intervals.
+        This is the public method for batch processing.
+        """
+        while True:
+            await asyncio.sleep(self.batch_timeout)
+            await self._process_batch()  # Calls the private method
+
+    async def process_failure_queue(self):
+        """
+        Retry failed ticks from the failure queue.
+        """
+        self.failure_queue_running = True
+        try:
+            while True:
+                tick_data = await self.redis.lpop(self.failure_queue)
+                if tick_data:
+                    tick_data = json.loads(tick_data)
+                    try:
+                        await self.add_tick(tick_data)
+                    except Exception as e:
+                        log_exception(f"Retry failed for tick data: {tick_data}, Error: {e}")
+                else:
+                    log_info("Failure queue is empty. Sleeping...")
+                    await asyncio.sleep(5)
+        except Exception as e:
+            log_exception(f"Failure queue processor encountered an error: {e}")
+            self.failure_queue_running = False
+
+    async def health_check(self):
+        """
+        Verifies Redis availability and the status of async jobs.
+
+        Returns:
+            dict: Health status of Redis and async jobs.
+        """
+        redis_status = "unhealthy"
+        batch_processor_status = "unhealthy"
+        failure_queue_status = "unhealthy"
+
+        # Check Redis health
+        try:
+            if self.redis and await self.redis.ping():
+                redis_status = "healthy"
+        except Exception:
+            redis_status = "unhealthy"
+
+        # Check async job statuses
+        batch_processor_status = "healthy" if self.batch_processor_running else "unhealthy"
+        failure_queue_status = "healthy" if self.failure_queue_running else "unhealthy"
+
+        # Return combined health status
+        return {
+            "redis_status": redis_status,
+            "batch_processor_status": batch_processor_status,
+            "failure_queue_status": failure_queue_status
+        }
+C:\stocksblitz\ticker_service\app\services\symbol_service.py:
+
+import asyncio
+import datetime
+import logging
+from typing import List, Dict, Any
+
+from fastapi import HTTPException,FastAPI,Depends
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+from concurrent.futures import ThreadPoolExecutor
+import pandas as pd
+from core.config import Settings
+from models import symbol as symbol_model
+from schemas import symbol as symbol_schema
+from services import broker_service
+from core.dependencies import get_broker_instance
+from shared_architecture.utils.service_helpers import connection_manager
+async def get_symbol_by_instrument_key(instrument_key: str) -> symbol_schema.Symbol:
+    """
+    Retrieves a symbol by its instrument key.
+    """
+    #from shared_architecture.utils.service_helpers import connection_manager
+    db=app.state.connections['timescaledb']
+    symbol = db.query(symbol_model.Symbol).filter(symbol_model.Symbol.instrument_key == instrument_key).first()
+    if not symbol:
+        raise HTTPException(status_code=404, detail="Symbol not found")
+    return symbol
+
+async def get_all_symbols(db: Session) -> List[symbol_schema.Symbol]:
+    """
+    Retrieves all symbols.
+    """
+    symbols = db.query(symbol_model.Symbol).all()
+    return symbols
+
+async def refresh_symbols(
+    db: Session,
+    app: FastAPI  # Add app as a parameter
+):
+    """
+    Refreshes the symbols table with batch processing and parallel execution.
+
+    Args:
+        db (Session): Database session.
+        broker_instance: The initialized broker instance.
+    """
+    try:
+        broker_instance=app.state.broker_instance
+        # Check if refresh has already been done today
+        today = datetime.date.today()
+        last_updated = db.query(func.max(symbol_model.Symbol.Local_Update_Datetime)).scalar()
+        if last_updated and last_updated.date() == today:
+            log_info("Symbol data already refreshed today.")
+
+            # Check if broker-specific tokens are updated
+            if await are_broker_tokens_updated(db, broker_instance):
+                log_info("Broker tokens are also up-to-date. Skipping refresh.")
+                return  # Skip the entire refresh process
+            
+            log_info("Broker tokens need update. Proceeding to update tokens.")
+            await update_broker_tokens(db, app)
+            return
+        log_info("Symbol data needs refresh. Proceeding with full refresh.")
+        new_symbols_data: List[Dict[str, Any]] = await broker_instance.get_symbols()
+        # Mark all existing symbols as inactive
+        db.query(symbol_model.Symbol).update({symbol_model.Symbol.Refresh_Flag: True, symbol_model.Symbol.Remarks: "Inactive"})
+        db.commit()
+        batch_size = 1000  # Adjust batch size as needed
+        new_symbols: List[symbol_schema.SymbolCreate] = [symbol_schema.SymbolCreate(**data) for data in new_symbols_data] # Convert raw data to SymbolCreate
+        for i in range(0, len(new_symbols), batch_size):
+            batch = new_symbols[i:i + batch_size]
+            await _process_symbol_batch(db, batch)
+        db.commit()
+        log_info("Symbols refreshed successfully.")
+
+        # Update broker specific tokens
+        await update_broker_tokens(db, app)
+
+    except Exception as e:
+        log_exception(f"Error refreshing symbols: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def are_broker_tokens_updated(db: Session, broker_instance) -> bool:
+    """
+    Checks if broker-specific tokens are already updated for all active symbols.
+    """
+    try:
+        symbols = db.query(symbol_model.Symbol).filter(symbol_model.Symbol.refresh_flag == False).all()
+        for symbol in symbols:
+            broker_token_column = f"{broker_instance.broker_name}_token"
+            if getattr(symbol, broker_token_column, None) is None:
+                return False  # Found a symbol with a missing broker token
+        return True  # All tokens are present
+    except Exception as e:
+        log_exception(f"Error checking broker tokens: {e}")
+        return False
+async def _process_symbol_batch(db: Session, batch: List[symbol_schema.SymbolCreate]):
+    """
+    Processes a batch of symbols for adding or updating.
+    """
+    # Convert batch to dictionaries
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    batch_dicts = [symbol.dict() for symbol in batch]
+    # Separate insert and update operations
+    existing_keys = {s.instrument_key for s in db.query(symbol_model.Symbol.instrument_key).filter(
+        symbol_model.Symbol.instrument_key.in_([s["instrument_key"] for s in batch_dicts])
+    )}
+    
+    inserts = []
+    updates = []
+    for symbol_data in batch_dicts:
+        symbol_data["Local_Update_Datetime"] = now  # Timestamp for update
+        if symbol_data["instrument_key"] in existing_keys:
+            updates.append(symbol_data)  # Updating existing records
+        else:
+            symbol_data["first_added_datetime"] = now  # Timestamp for new insertions
+            inserts.append(symbol_data)  # New records
+    # Perform bulk inserts and updates efficiently
+    if inserts:
+        db.bulk_insert_mappings(symbol_model.Symbol, inserts)
+    if updates:
+        db.bulk_update_mappings(symbol_model.Symbol, updates)
+
+    db.commit()
+    log_info(f"Batch processing complete: {len(inserts)} inserts, {len(updates)} updates")
+
+    # for new_symbol_data in batch:
+    #     new_symbol = symbol_model.Symbol(**new_symbol_data.dict())  # Convert to dictionary
+    #     existing_symbol = db.query(symbol_model.Symbol).filter(symbol_model.Symbol.instrument_key == new_symbol.instrument_key).first()
+
+    #     # Handle local_update_datetime explicitly
+    #     if new_symbol_data.Local_Update_Datetime is None or pd.isna(new_symbol_data.Local_Update_Datetime):
+    #         new_symbol.local_update_datetime = None
+    #     else:
+    #         new_symbol.Local_Update_Datetime = new_symbol_data.Local_Update_Datetime
+
+    #     if existing_symbol:
+    #         # Update existing symbol
+    #         for attr, value in new_symbol_data.dict().items():
+    #             setattr(existing_symbol, attr, value)
+    #         existing_symbol.Refresh_Flag = False
+    #         existing_symbol.remarks = None
+    #         existing_symbol.Local_Update_Datetime = datetime.datetime.now(datetime.timezone.utc)
+    #     else:
+    #         # Add new symbol
+    #         new_symbol.Refresh_Flag = False
+    #         new_symbol.remarks = None
+    #         new_symbol.first_added_datetime = datetime.datetime.now(datetime.timezone.utc)  # Set on insert
+    #         new_symbol.Local_Update_Datetime = datetime.datetime.now(datetime.timezone.utc)
+    #         db.add(new_symbol)
+    # db.commit()
+    # log_info("Batch processing complete")
+async def update_broker_tokens(
+    db: Session,
+    app: FastAPI,  # Add app as a dependency
+):
+    """
+    Updates broker-specific tokens for each symbol using parallel processing.
+
+    Args:
+        db (Session): Database session.
+        app (FastAPI): The FastAPI application instance.
+    """
+    try:
+        broker_instance = state.broker_instance  # Get the broker instance from state
+        if not broker_instance:
+            raise Exception("Broker instance not initialized in state")
+
+        symbols = db.query(symbol_model.Symbol).filter(symbol_model.Symbol.Refresh_Flag == False).all()
+
+        tasks = [
+            _update_symbol_token(db, broker_instance, symbol)
+            for symbol in symbols
+        ]
+        await asyncio.gather(*tasks)
+
+        db.commit()
+        log_info("Broker tokens updated successfully.")
+    except Exception as e:
+        log_exception(f"Error updating broker tokens: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _update_symbol_token(
+    db: Session,
+    broker_instance,  # Get the broker instance
+    symbol: symbol_model.Symbol,
+):
+    """
+    Updates the broker token for a single symbol.
+
+    Args:
+        db (Session): Database session.
+        broker_instance: The initialized broker instance (e.g., Breeze or Kite).
+        symbol (symbol_model.Symbol): The symbol to update.
+    """
+    broker_token = await broker_instance.get_symbol_token(symbol.instrument_key)
+    if broker_token:
+        broker_token_column = f"{broker_instance.broker_name}_Token"
+        setattr(symbol, broker_token_column, broker_token)
+        symbol.localupdatedatetime = datetime.datetime.now(datetime.timezone.utc)
+
+async def get_broker_token(instrument_key: str, broker_name: str) -> str:
+    """
+    Retrieves the broker-specific token for a given instrument key and broker name.
+    """
+    symbol = await get_symbol_by_instrument_key(instrument_key)
+    if not symbol:
+        raise HTTPException(status_code=404, detail="Symbol not found")
+    column_name = f"{broker_name}_Token"
+    if not hasattr(symbol, column_name):
+        raise ValueError(f"Column '{column_name}' does not exist in Symbol record.")
+
+    # Retrieve the column value
+    broker_token = getattr(symbol, column_name, None)
+
+    # Condition A: Column exists but not populated (None or empty string)
+    if broker_token is None or broker_token.strip() == "":
+        raise HTTPException(status_code=204, detail=f"Column '{column_name}' exists but is not populated.")
+
+    # Condition C: Column exists and has a value
+    return broker_token
+C:\stocksblitz\ticker_service\app\services\test_db.py:
+
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, text
+
+# Define your database connection
+DATABASE_URL = "postgresql+psycopg2://tradmin:tradpass@localhost/tradingdb"
+engine = create_engine(DATABASE_URL)
+
+# Create a session factory
+SessionLocal = sessionmaker(bind=engine)
+
+# Open a session and test the query
+with SessionLocal() as session:
+    result = session.execute(text("SELECT * FROM tradingdb.brokers LIMIT 5"))
+    print(result.fetchall())
+C:\stocksblitz\ticker_service\app\services\tick_service.py:
+
+# tick_service.py
+import asyncio
+import logging
+from typing import List, Dict, Any
+
+from services import timescaledb_service, rabbitmq_service
+from shared_architecture.db import get_db
+from core.dependencies import get_app
+from sqlalchemy.orm import Session
+from fastapi import FastAPI
+
+class TickProcessor:
+    def __init__(self):
+        self.tick_queue = asyncio.Queue()  # Shared queue for all brokers
+    def start_processing(self, app: FastAPI):
+        """
+        Start the tick processing queue in a background task.
+        """
+        log_info("Starting tick processing...")
+        asyncio.create_task(process_tick_queue(app))
+        log_info("Started tick processing...")
+
+    async def enqueue_tick(self, tick_data: Dict[str, Any]):
+        """Adds standardized tick data to the queue."""
+       
+        await self.tick_queue.put(tick_data)
+        print(f"Enqueued tick: {tick_data}")
+
+async def process_tick_queue(app: FastAPI):
+    """
+    Consumes tick data from the broker's queue, processes it, and stores it.
+    Processes ticks in batches or every second, whichever comes first.
+    """
+    try:
+        log_info("process_tick_queue started...")
+
+        batch_size = 50  # Number of ticks to process in one batch
+        time_interval = 1.0  # Time in seconds to process available ticks
+
+        while True:
+            if not state.tick_processor.tick_queue.empty():
+
+                print("Tick queue consumer is running...")
+                start_time = asyncio.get_event_loop().time()  # Capture the start time
+                batch = []
+                while not state.tick_processor.tick_queue.empty():
+                    tick_data = await state.tick_processor.tick_queue.get()
+                    batch.append(tick_data)
+                if batch:
+                    log_info(f"Processing batch of size {len(batch)}")
+                    await rabbitmq_service.publish_tick_batch(batch)
+
+            else:
+                logging.debug("Tick queue is empty, sleeping...")
+                await asyncio.sleep(0.5)
+                    #await rabbitmq_service.publish_tick_batch(batch)
+            # Collect ticks for processing
+            while len(batch) < batch_size and (asyncio.get_event_loop().time() - start_tie) < time_interval:
+                if not state.tick_processor.tick_queue.empty():
+                    tick_data = await state.tick_processor.tick_queue.get()
+                    print(f"Retrieved tick: {tick_data}")
+
+                    batch.append(tick_data)
+                    logging.debug(f"Tick retrieved from queue: {tick_data}")
+                else:
+                    break
+
+            # Process the batch if it has any data
+            if batch:
+                log_info(f"Processing batch of size {len(batch)}")
+                await process_tick_batch(app, batch)
+
+            # Ensure consistent intervals
+            elapsed_time = asyncio.get_event_loop().time() - start_time
+            if elapsed_time < time_interval:
+                await asyncio.sleep(time_interval - elapsed_time)
+
+    except Exception as e:
+        log_exception(f"Error processing tick queue: {e}")
+
+async def process_tick_batch(app: FastAPI, tick_batch: List[Dict[str, Any]]):
+    """
+    Handles batch processing of tick data.
+    """
+    try:
+        # Database session setup
+        # from services import timescaledb_service, rabbitmq_service
+        # db_session = await get_db()
+
+        # # Store tick data in TimescaleDB
+        # await timescaledb_service.batch_insert_ticks(db_session, tick_batch)
+
+        # Publish tick data to RabbitMQ
+        await rabbitmq_service.publish_tick_batch(tick_batch)
+
+        log_info(f"Successfully processed {len(tick_batch)} ticks.")
+    except Exception as e:
+        log_exception(f"Error processing tick batch: {e}")
+C:\stocksblitz\ticker_service\app\services\timescaledb_service.py:
+
+import os
+import logging
+import psycopg2
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.sql import text
+from sqlalchemy import tuple_
+from sqlalchemy import create_engine
+from schemas.historical_data import HistoricalDataCreate
+from models.historical_data import HistoricalData
+from sqlalchemy import exc
+from typing import List
+from sqlalchemy.orm import Session
+logging.basicConfig(
+level=logging.INFO,
+format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+class TimescaleDBConnection:
+    def __init__(self, config: dict):
+        """
+        Initialize TimescaleDB connection.
+
+        Args:
+        config (dict): Configuration dictionary.
+        """
+        self.config = config
+        self.engine = self._create_engine()
+        self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+        log_info(f"TimescaleDBConnection initialized with config: {self.config}")
+
+    def _create_engine(self):
+        """
+        Creates the SQLAlchemy engine.
+        """
+        db_url = self._get_database_url()
+        return create_engine(
+        db_url,
+        pool_size=int(self.config.get("pool_size", 10)), # Ensure int, provide default
+        max_overflow=int(self.config.get("max_overflow", 5)), # Ensure int, provide default
+        pool_timeout=int(self.config.get("pool_timeout", 30)), # Ensure int, provide default
+        pool_recycle=int(self.config.get("pool_recycle", 1800)), # Ensure int, provide default
+        )
+
+    def _get_database_url(self) -> str:
+        """
+        Constructs the database URL from configuration.
+        """
+        return (
+        f"postgresql://{self.config.get('postgres_user')}:"
+        f"{self.config.get('postgres_password')}@"
+        f"{self.config.get('postgres_host')}:"
+        f"{self.config.get('postgres_port')}/"
+        f"{self.config.get('postgres_db')}"
+        )
+
+    def get_session(self):
+        """
+        Provides a database session.
+        """
+        return self.SessionLocal()
+
+async def batch_upsert_historical_data(db, data_list: List[HistoricalDataCreate]) -> List[HistoricalData]:
+    """
+    Batch upserts historical data into the historical_data table.
+    Efficiently handles large data volumes using bulk insert/update.
+    """
+    try:
+        # Extract timestamps, instrument keys, and intervals for existing record lookup
+        lookup_keys = [(d['datetime'], d['instrument_key'], d['interval']) for d in data_list]
+
+        # Fetch existing records efficiently
+
+
+        existing_records = db.query(HistoricalData).filter(
+            tuple_(HistoricalData.time, HistoricalData.instrument_key, HistoricalData.interval).in_(lookup_keys)
+        ).all()
+
+
+        # Convert existing records to a dict for fast lookup
+        existing_map = {(rec.time, rec.instrument_key, rec.interval): rec for rec in existing_records}
+
+        new_records = []
+        update_records = []
+
+        for data in data_list:
+            # Ensure 'datetime' is mapped to 'time'
+            data['time'] = data.pop('datetime') if 'datetime' in data else None
+            
+            if data['time'] is None:
+                raise ValueError("Missing required 'datetime' field in data!")
+
+            # Create the key tuple
+            key = (data['time'], data['instrument_key'], data['interval'])
+
+            if key in existing_map:
+                # Update the record instead of inserting a new one
+                update_records.append(data)
+            else:
+                # Add to new records for bulk insert
+                new_records.append(data)
+
+        # Perform bulk updates for existing records
+        if update_records:
+            db.bulk_update_mappings(HistoricalData, update_records)
+
+        # Perform bulk inserts for new records
+        if new_records:
+            db.bulk_insert_mappings(HistoricalData, new_records)
+
+        db.commit()
+
+        return new_records + update_records  # Return stored data
+    except exc.SQLAlchemyError as e:
+        db.rollback()
+        log_exception(f"Error batch upserting historical data: {e}")
+        raise    # No TimescaleDBPool class anymore
+C:\stocksblitz\ticker_service\app\services\__init__.py:
+
+C:\stocksblitz\ticker_service\app\utils\data_utils.py:
+
+from typing import Dict, Any, Optional,Type,Union
+import pandas as pd
+from datetime import datetime,date
+def safe_convert(value: Any, target_type: Type, default: Optional[Any] = None):
+    """
+    Safely converts a value to the target type, handling None and potential conversion errors.
+    """
+    if value is None:
+        return default
+    try:
+        return target_type(value)
+    except (ValueError, TypeError):
+        return default
+    except Exception as e:
+        print(f"Unexpected error during conversion: {e}")
+        return default
+    
+def safe_convert_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    """
+    Safely converts a value to an integer, handling None and potential errors.
+
+    Args:
+        value: The value to convert.
+        default: The value to return if conversion fails or if value is None.
+
+    Returns:
+        The converted integer, or the default if conversion fails or value is None.
+    """
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+    except Exception as e:
+        print(f"Unexpected error converting to int: {e}")  # Log unexpected errors
+        return default
+def safe_convert_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    """
+    Safely converts a value to a float, handling None and potential errors.
+
+    Args:
+        value: The value to convert.
+        default: The value to return if conversion fails or if value is None.
+
+    Returns:
+        The converted float, or the default if conversion fails or value is None.
+    """
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+    except Exception as e:
+        print(f"Unexpected error converting to float: {e}")  # Log unexpected errors
+        return default
+def safe_convert_bool(value: Any, default: Optional[bool] = None) -> Optional[bool]:
+    """
+    Safely converts a value to a boolean, handling None and various representations.
+
+    Args:
+        value: The value to convert.
+        default: The value to return if conversion fails or if value is None.
+
+    Returns:
+        The converted boolean, or the default if conversion fails or value is None.
+    """
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)  # 0 -> False, non-zero -> True
+    elif isinstance(value, str):
+        if value.lower() in ("true", "1", "yes"):
+            return True
+        elif value.lower() in ("false", "0", "no"):
+            return False
+        else:
+            return default  # Return default for invalid strings
+    else:
+        try:
+            return bool(value)  # General boolean conversion
+        except (ValueError, TypeError):
+            return default
+        except Exception as e:
+            print(f"Unexpected error converting to bool: {e}")
+            return default
+def safe_parse_datetime(date_input: Union[str, datetime, date, pd.Timestamp]) -> Optional[datetime]:
+    """
+    Safely parses a string or datetime-like object into a datetime object.
+    Handles pd.NaT.
+    """
+    if date_input is None or pd.isna(date_input):
+        return None
+    if isinstance(date_input, datetime):
+        return date_input
+    if isinstance(date_input, date):
+        return datetime(date_input.year, date_input.month, date_input.day)
+    if isinstance(date_input, str):
+        formats = [
+            '%Y-%m-%d %H:%M:%S.%f',
+            '%Y-%m-%d %H:%M:%S',
+            '%Y-%m-%d',
+            '%d-%b-%Y',
+            '%d-%m-%Y %H:%M:%S',
+            '%d/%m/%Y',
+            '%m/%d/%Y',
+            '%Y/%m/%d',
+            '%Y%m%d',
+            '%d%m%Y'
+        ]
+        for fmt in formats:
+            try:
+                return datetime.strptime(date_input, fmt)
+            except ValueError:
+                pass  # Try the next format
+    return None
+
+# def create_standardized_feed_dict(raw_feed_data: Dict[str, Any]) -> Dict[str, Any]:
+#     """
+#     Standardizes a tick data message into a consistent dictionary format.
+
+#     Args:
+#         raw_feed_data (Dict[str, Any]): The raw tick data dictionary from the broker.
+
+#     Returns:
+#         Dict[str, Any]: A dictionary with standardized tick data fields.
+#     """
+
+#     standardized_feed = {
+#         "instrument_key": raw_feed_data.get("instrument_key"),
+#         "symbol": raw_feed_data.get("symbol"),
+#         "open": safe_convert_float(raw_feed_data.get("open")),
+#         "high": safe_convert_float(raw_feed_data.get("high")),
+#         "low": safe_convert_float(raw_feed_data.get("low")),
+#         "close": safe_convert_float(raw_feed_data.get("close")),
+#         "volume": safe_convert_int(raw_feed_data.get("volume")),
+#         "ltt": safe_parse_datetime(raw_feed_data.get("ltt")),
+#         "oi": safe_convert_int(raw_feed_data.get("OI")),
+#         "change": safe_convert_float(raw_feed_data.get("change")),
+#         "bPrice": safe_convert_float(raw_feed_data.get("bPrice")),
+#         "bQty": safe_convert_int(raw_feed_data.get("bQty")),
+#         "sPrice": safe_convert_float(raw_feed_data.get("sPrice")),
+#         "sQty": safe_convert_int(raw_feed_data.get("sQty")),
+#         "ltq": safe_convert_int(raw_feed_data.get("ltq")),
+#         "avgPrice": safe_convert_float(raw_feed_data.get("avgPrice")),
+#         "quotes": raw_feed_data.get("quotes"),
+#         "CHNGOI": safe_convert_int(raw_feed_data.get("CHNGOI")),
+#         "ttq": safe_convert_int(raw_feed_data.get("ttq")),
+#         "totalBuyQt": safe_convert_int(raw_feed_data.get("totalBuyQt")),
+#         "totalSellQ": safe_convert_int(raw_feed_data.get("totalSellQ")),
+#         "ttv": raw_feed_data.get("ttv"),
+#         "trend": raw_feed_data.get("trend"),
+#         "lowerCktLm": safe_convert_float(raw_feed_data.get("lowerCktLm")),
+#         "upperCktLm": safe_convert_float(raw_feed_data.get("upperCktLm")),
+#         "exchange": raw_feed_data.get("exchange"),
+#         "stock_name": raw_feed_data.get("stock_name"),
+#         "product_type": raw_feed_data.get("product_type"),
+#         "expiry_date": safe_parse_datetime(raw_feed_data.get("expiry_date")),
+#         "strike_price": safe_convert_float(raw_feed_data.get("strike_price")),
+#         "right": raw_feed_data.get("right")
+#     }
+
+#     return standardized_feed
+C:\stocksblitz\ticker_service\app\utils\helper.py:
+
+C:\stocksblitz\ticker_service\app\utils\instrument_key_helper.py:
+
+C:\stocksblitz\ticker_service\app\utils\logging_helper.py:
+
+import logging
+import logging.config
+import os
+from pathlib import Path
+
+def configure_logging(service_name: str = "microservice", log_level: str = "INFO"):
+    """
+    Configures logging for the microservice.
+
+    Args:
+        service_name: The name of the microservice (used in log messages).
+        log_level: The desired logging level (e.g., "DEBUG", "INFO", "WARNING", "ERROR").
+    """
+
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)  # Create the 'logs' directory if it doesn't exist
+    log_file = log_dir / f"{service_name}.log"
+
+    # Basic configuration (can be extended)
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper(), logging.INFO),  # Default to INFO
+        format=f"%(asctime)s - %(levelname)s - {service_name} - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(),  # Output to console
+            logging.FileHandler(log_file),  # Output to file
+        ],
+    )
+
+    # Example of more advanced configuration using logging.config.dictConfig
+    # if not os.path.exists("logging.conf"):
+    #     print("logging.conf not found")
+    # else:
+    #     logging.config.fileConfig('logging.conf', disable_existing_loggers=False)
+
+    log_info(f"Logging configured for {service_name} at level {log_level}")
+
+
+if __name__ == "__main__":
+    configure_logging("test_service", "DEBUG")
+    logging.debug("This is a debug message.")
+    log_info("This is an info message.")
+    log_warning("This is a warning message.")
+    log_exception("This is an error message.")
+    logging.critical("This is a critical message.")
+C:\stocksblitz\ticker_service\app\utils\__init__.py:
+
+from api import api_router
+C:\stocksblitz\ticker_service\docker\Dockerfile:
+
+FROM ghcr.io/raghurammutya/stocksblitz/base-dev:latest
+
+WORKDIR /app
+
+COPY . .
+
+CMD ["python", "-m", "app.main"]
+C:\stocksblitz\ticker_service\kubernetes\ticker_service.yaml:
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ticker-service
+  namespace: stocksblitz
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ticker-service
+  template:
+    metadata:
+      labels:
+        app: ticker-service
+    spec:
+      containers:
+      - name: ticker-service
+        image: user_service:dev
+        ports:
+        - containerPort: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ticker-service
+  namespace: stocksblitz
+spec:
+  selector:
+    app: ticker-service
+  ports:
+  - port: 80
+    targetPort: 8000
+C:\stocksblitz\ticker_service\logs\ticker_service.log:
+
