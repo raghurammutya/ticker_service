@@ -3,11 +3,6 @@ import json
 import asyncio
 from redis.asyncio import Redis
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-
 
 class RedisService:
     def __init__(self, redis, batch_size=10, batch_timeout=1.0, failure_queue="failure_queue"):
@@ -46,9 +41,9 @@ class RedisService:
                     pipe.xadd(stream_name, tick_data_cleaned)
 
                 await pipe.execute()
-                logging.info(f"Pushed {len(tick_batch)} ticks to Redis.")
+                log_info(f"Pushed {len(tick_batch)} ticks to Redis.")
         except Exception as e:
-            logging.error(f"Failed to push batch ticks to Redis: {e}")
+            log_exception(f"Failed to push batch ticks to Redis: {e}")
 
     async def run_batch_processor(self):
         """
@@ -72,12 +67,12 @@ class RedisService:
                     try:
                         await self.add_tick(tick_data)
                     except Exception as e:
-                        logging.error(f"Retry failed for tick data: {tick_data}, Error: {e}")
+                        log_exception(f"Retry failed for tick data: {tick_data}, Error: {e}")
                 else:
-                    logging.info("Failure queue is empty. Sleeping...")
+                    log_info("Failure queue is empty. Sleeping...")
                     await asyncio.sleep(5)
         except Exception as e:
-            logging.error(f"Failure queue processor encountered an error: {e}")
+            log_exception(f"Failure queue processor encountered an error: {e}")
             self.failure_queue_running = False
 
     async def health_check(self):

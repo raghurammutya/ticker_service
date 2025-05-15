@@ -1,20 +1,20 @@
 import os
-import logging
+
 import psycopg2
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.sql import text
 from sqlalchemy import tuple_
 from sqlalchemy import create_engine
-from schemas.historical_data import HistoricalDataCreate
-from models.historical_data import HistoricalData
+from app.schemas.historical_data import HistoricalDataCreate
+from shared_architecture.utils.logging_utils import log_info, log_error, log_warning
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from shared_architecture.db.models.historical_data import HistoricalData
 from sqlalchemy import exc
 from typing import List
 from sqlalchemy.orm import Session
-logging.basicConfig(
-level=logging.INFO,
-format="%(asctime)s - %(levelname)s - %(message)s",
-)
 
+CHUNK_SIZE = 500
 class TimescaleDBConnection:
     def __init__(self, config: dict):
         """
@@ -26,7 +26,7 @@ class TimescaleDBConnection:
         self.config = config
         self.engine = self._create_engine()
         self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
-        logging.info(f"TimescaleDBConnection initialized with config: {self.config}")
+        log_info(f"TimescaleDBConnection initialized with config: {self.config}")
 
     def _create_engine(self):
         """
@@ -59,58 +59,108 @@ class TimescaleDBConnection:
         """
         return self.SessionLocal()
 
-async def batch_upsert_historical_data(db, data_list: List[HistoricalDataCreate]) -> List[HistoricalData]:
+async def batch_upsert_historical_data(
+    self,
+    session: AsyncSession,
+    instrument_key: str,
+    interval: str,
+    data_list: list[dict],
+    source: str = "ticker_service"
+):
     """
-    Batch upserts historical data into the historical_data table.
-    Efficiently handles large data volumes using bulk insert/update.
+    Efficiently insert/update OHLCV data in TimescaleDB with batching and conflict handling.
     """
-    try:
-        # Extract timestamps, instrument keys, and intervals for existing record lookup
-        lookup_keys = [(d['datetime'], d['instrument_key'], d['interval']) for d in data_list]
+    if not data_list:
+        log_info(f"No data to insert for {instrument_key}:{interval}")
+        return
 
-        # Fetch existing records efficiently
+    start_ts = datetime.utcnow()
 
+    total_inserted = 0
+    total_skipped = 0
 
-        existing_records = db.query(HistoricalData).filter(
-            tuple_(HistoricalData.time, HistoricalData.instrument_key, HistoricalData.interval).in_(lookup_keys)
-        ).all()
+    for chunk_start in range(0, len(data_list), CHUNK_SIZE):
+        chunk = data_list[chunk_start:chunk_start + CHUNK_SIZE]
 
+        # Normalize to dict
+        chunk = [
+            d.dict() if hasattr(d, "dict") else dict(d)
+            for d in chunk
+        ]
 
-        # Convert existing records to a dict for fast lookup
-        existing_map = {(rec.time, rec.instrument_key, rec.interval): rec for rec in existing_records}
+        # Ensure source is added
+        for d in chunk:
+            d["source"] = source
 
-        new_records = []
-        update_records = []
+        # Build the raw SQL insert
+        values_sql = ",".join(
+            [
+                f"""(
+                    :time_{i}, :instrument_key_{i}, :interval_{i},
+                    :open_{i}, :high_{i}, :low_{i}, :close_{i}, :volume_{i},
+                    :open_interest_{i}, :greek_iv_{i}, :greek_delta_{i}, 
+                    :greek_theta_{i}, :greek_gamma_{i}, :greek_vega_{i}, 
+                    :greek_rho_{i}, :source_{i}
+                )"""
+                for i in range(len(chunk))
+            ]
+        )
 
-        for data in data_list:
-            # Ensure 'datetime' is mapped to 'time'
-            data['time'] = data.pop('datetime') if 'datetime' in data else None
-            
-            if data['time'] is None:
-                raise ValueError("Missing required 'datetime' field in data!")
+        sql = text(f"""
+        INSERT INTO historical_data (
+            time, instrument_key, interval,
+            open, high, low, close, volume,
+            open_interest, greek_iv, greek_delta,
+            greek_theta, greek_gamma, greek_vega,
+            greek_rho, source
+        ) VALUES {values_sql}
+        ON CONFLICT (time, instrument_key, interval)
+        DO UPDATE SET
+            open = EXCLUDED.open,
+            high = EXCLUDED.high,
+            low = EXCLUDED.low,
+            close = EXCLUDED.close,
+            volume = EXCLUDED.volume,
+            open_interest = EXCLUDED.open_interest,
+            greek_iv = EXCLUDED.greek_iv,
+            greek_delta = EXCLUDED.greek_delta,
+            greek_theta = EXCLUDED.greek_theta,
+            greek_gamma = EXCLUDED.greek_gamma,
+            greek_vega = EXCLUDED.greek_vega,
+            greek_rho = EXCLUDED.greek_rho,
+            source = EXCLUDED.source
+        ;
+        """)
 
-            # Create the key tuple
-            key = (data['time'], data['instrument_key'], data['interval'])
+        # Map parameters
+        params = {}
+        for i, d in enumerate(chunk):
+            params.update({
+                f"time_{i}": d.get("time"),
+                f"instrument_key_{i}": instrument_key,
+                f"interval_{i}": interval,
+                f"open_{i}": d.get("open"),
+                f"high_{i}": d.get("high"),
+                f"low_{i}": d.get("low"),
+                f"close_{i}": d.get("close"),
+                f"volume_{i}": d.get("volume"),
+                f"open_interest_{i}": d.get("open_interest"),
+                f"greek_iv_{i}": d.get("greek_iv"),
+                f"greek_delta_{i}": d.get("greek_delta"),
+                f"greek_theta_{i}": d.get("greek_theta"),
+                f"greek_gamma_{i}": d.get("greek_gamma"),
+                f"greek_vega_{i}": d.get("greek_vega"),
+                f"greek_rho_{i}": d.get("greek_rho"),
+                f"source_{i}": d.get("source"),
+            })
 
-            if key in existing_map:
-                # Update the record instead of inserting a new one
-                update_records.append(data)
-            else:
-                # Add to new records for bulk insert
-                new_records.append(data)
+        await session.execute(sql, params)
+        total_inserted += len(chunk)
 
-        # Perform bulk updates for existing records
-        if update_records:
-            db.bulk_update_mappings(HistoricalData, update_records)
+    await session.commit()
 
-        # Perform bulk inserts for new records
-        if new_records:
-            db.bulk_insert_mappings(HistoricalData, new_records)
-
-        db.commit()
-
-        return new_records + update_records  # Return stored data
-    except exc.SQLAlchemyError as e:
-        db.rollback()
-        logging.error(f"Error batch upserting historical data: {e}")
-        raise    # No TimescaleDBPool class anymore
+    end_ts = datetime.utcnow()
+    log_info(
+        f"[Timescale] Inserted {total_inserted} rows for {instrument_key}:{interval} "
+        f"in {round((end_ts - start_ts).total_seconds(), 2)}s"
+    )

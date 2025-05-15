@@ -1,18 +1,16 @@
 import os
 import logging
 from redis.asyncio import Redis
+from shared_architecture.config.config_loader import get_env
 
 # Logging Configuration
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+
 
 # Redis Configuration
-REDIS_HOST = os.getenv("SHARED_REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("SHARED_REDIS_PORT", 6379))
-REDIS_DB = int(os.getenv("SHARED_REDIS_DB", 0))
-REDIS_MAX_CONNECTIONS = int(os.getenv("SHARED_REDIS_MAX_CONNECTIONS", 10))
+REDIS_HOST = env_config("SHARED_REDIS_HOST", "localhost")
+REDIS_PORT = int(env_config("SHARED_REDIS_PORT", 6379))
+REDIS_DB = int(env_config("SHARED_REDIS_DB", 0))
+REDIS_MAX_CONNECTIONS = int(env_config("SHARED_REDIS_MAX_CONNECTIONS", 10))
 
 async def connect_to_redis():
     """
@@ -32,11 +30,11 @@ async def connect_to_redis():
 
         # Test the connection
         await redis_client.ping()
-        logging.info("Redis async connection successful!")
+        log_info("Redis async connection successful!")
         return redis_client
 
     except Exception as e:
-        logging.error(f"Error connecting to Redis asynchronously: {e}")
+        log_exception(f"Error connecting to Redis asynchronously: {e}")
         return None
 
 async def close_redis_connection(redis_client):
@@ -49,6 +47,6 @@ async def close_redis_connection(redis_client):
     if redis_client:
         try:
             await redis_client.close()
-            logging.info("Redis async connection closed successfully.")
+            log_info("Redis async connection closed successfully.")
         except Exception as e:
-            logging.error(f"Error closing Redis connection: {e}")
+            log_exception(f"Error closing Redis connection: {e}")

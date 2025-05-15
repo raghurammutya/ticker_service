@@ -1,9 +1,11 @@
 import os
 from fastapi import APIRouter, Depends, HTTPException,Request
 from sqlalchemy.orm import Session
-from schemas.historical_data import HistoricalDataRequest,HistoricalDataCreate
-from services import broker_service, timescaledb_service
-from services import broker_service, symbol_service
+from app.schemas.historical_data import HistoricalDataRequest,HistoricalDataCreate
+from app.services import broker_service, timescaledb_service
+from shared_architecture.config.config_loader import get_env
+
+from app.services import broker_service, symbol_service
 import logging
 
 from shared_architecture.db.models.broker import Broker
@@ -14,15 +16,12 @@ import asyncio
 
 
 router = APIRouter()
-logging.basicConfig(
-level=logging.INFO,
-format="%(asctime)s - %(levelname)s - %(message)s",
-)
+
 def get_broker(request: Request) -> str:
     """
     Retrieve broker name from environment variables.
     """
-    return os.getenv("BROKER_NAME", "")  # Use a default if not set
+    return env_config("DB_NAME", default="")
 async def check_api_rate_limit(db: Session, broker):
     """
     Checks if the API rate limit has been exceeded.
@@ -65,7 +64,7 @@ async def fetch_historical_data(
     except HTTPException as e:
         raise e
     except Exception as e:
-        logging.error(f"Error fetching historical data: {e}")
+        log_exception(f"Error fetching historical data: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     
 

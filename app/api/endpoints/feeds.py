@@ -1,15 +1,15 @@
 import asyncio
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from schemas import feed as feed_schema
-from services import broker_service, rabbitmq_service, timescaledb_service
+from app.schemas import feed as feed_schema
+from app.services import broker_service, rabbitmq_service, timescaledb_service
 from shared_architecture.db import get_db
 from shared_architecture.errors.custom_exceptions import ServiceUnavailableError
 from typing import List, Dict, Any
-from core.dependencies import get_app
-import logging
+from app.core.dependencies import get_app
+from shared_architecture.utils.logging_utils import log_info, log_warning, log_exception
 # from shared_architecture.utils.service_helpers import connection_manager  # Old way
-from core.dependencies import get_rabbitmq_connection  # New way
+from app.core.dependencies import get_rabbitmq_connection  # New way
 
 router = APIRouter()
 
@@ -31,7 +31,7 @@ async def create_feed(
 
         return db_feed
     except Exception as e:
-        logging.error(f"Error processing feed: {e}")
+        log_exception(f"Error processing feed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     except rabbitmq_service.RabbitMQConnectionError as e:  # Example
         raise ServiceUnavailableError(service_name="RabbitMQ", message=str(e))
@@ -53,7 +53,8 @@ async def simulate_ticks(interval: float = 1.0):
     """
     app = get_app()
     breeze = app.state.broker_instance  # Assuming broker_instance is a Breeze instance
-    return await breeze.start_simulation(interval=interval)
+    await breeze.start_simulation(interval=interval)
+    return {"status": "started"} 
 
 @router.post("/stop_simulate_ticks/")
 async def stop_simulate_ticks():
@@ -62,4 +63,5 @@ async def stop_simulate_ticks():
     """
     app = get_app()
     breeze = app.state.broker_instance
-    return await breeze.stop_simulation()
+    await breeze.stop_simulation()
+    return {"status": "stopped"} 

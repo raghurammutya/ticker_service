@@ -3,9 +3,9 @@ import asyncio
 import logging
 from typing import List, Dict, Any
 
-from services import timescaledb_service, rabbitmq_service
+from app.services import timescaledb_service, rabbitmq_service
 from shared_architecture.db import get_db
-from core.dependencies import get_app
+from app.core.dependencies import get_app
 from sqlalchemy.orm import Session
 from fastapi import FastAPI
 
@@ -16,9 +16,9 @@ class TickProcessor:
         """
         Start the tick processing queue in a background task.
         """
-        logging.info("Starting tick processing...")
+        log_info("Starting tick processing...")
         asyncio.create_task(process_tick_queue(app))
-        logging.info("Started tick processing...")
+        log_info("Started tick processing...")
 
     async def enqueue_tick(self, tick_data: Dict[str, Any]):
         """Adds standardized tick data to the queue."""
@@ -32,7 +32,7 @@ async def process_tick_queue(app: FastAPI):
     Processes ticks in batches or every second, whichever comes first.
     """
     try:
-        logging.info("process_tick_queue started...")
+        log_info("process_tick_queue started...")
 
         batch_size = 50  # Number of ticks to process in one batch
         time_interval = 1.0  # Time in seconds to process available ticks
@@ -47,7 +47,7 @@ async def process_tick_queue(app: FastAPI):
                     tick_data = await state.tick_processor.tick_queue.get()
                     batch.append(tick_data)
                 if batch:
-                    logging.info(f"Processing batch of size {len(batch)}")
+                    log_info(f"Processing batch of size {len(batch)}")
                     await rabbitmq_service.publish_tick_batch(batch)
 
             else:
@@ -67,7 +67,7 @@ async def process_tick_queue(app: FastAPI):
 
             # Process the batch if it has any data
             if batch:
-                logging.info(f"Processing batch of size {len(batch)}")
+                log_info(f"Processing batch of size {len(batch)}")
                 await process_tick_batch(app, batch)
 
             # Ensure consistent intervals
@@ -76,7 +76,7 @@ async def process_tick_queue(app: FastAPI):
                 await asyncio.sleep(time_interval - elapsed_time)
 
     except Exception as e:
-        logging.error(f"Error processing tick queue: {e}")
+        log_exception(f"Error processing tick queue: {e}")
 
 async def process_tick_batch(app: FastAPI, tick_batch: List[Dict[str, Any]]):
     """
@@ -93,6 +93,6 @@ async def process_tick_batch(app: FastAPI, tick_batch: List[Dict[str, Any]]):
         # Publish tick data to RabbitMQ
         await rabbitmq_service.publish_tick_batch(tick_batch)
 
-        logging.info(f"Successfully processed {len(tick_batch)} ticks.")
+        log_info(f"Successfully processed {len(tick_batch)} ticks.")
     except Exception as e:
-        logging.error(f"Error processing tick batch: {e}")
+        log_exception(f"Error processing tick batch: {e}")

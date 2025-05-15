@@ -1,11 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
-import logging
 from sqlalchemy.orm import Session
-from schemas import subscription as subscription_schema
-from services import broker_service, symbol_service
+from app.schemas import subscription as subscription_schema
+from app.services import broker_service, symbol_service
 from pydantic import BaseModel, Field
 from shared_architecture.db.models.broker import Broker
 from shared_architecture.db.session import get_db
+from shared_architecture.config.config_loader import get_env
+from shared_architecture.utils.logging_utils import log_info, log_warning, log_exception
 # Pydantic model to ensure arbitrary types are allowed
 
 # Router declaration
@@ -18,7 +19,7 @@ def get_broker(request: Request) -> str:
     """
     Retrieve broker name from environment variables.
     """
-    return os.getenv("BROKER_NAME", "")  # Use a default if not set
+    return env_config("BROKER_NAME", "")  # Use a default if not set
 
 @router.get("/test-subscriptions", status_code=200)
 async def test_subscriptions():
@@ -57,7 +58,7 @@ async def subscribe_to_symbol(
     except HTTPException as e:
         raise e
     except Exception as e:
-        logging.error(f"Error subscribing to symbol: {e}")
+        log_exception(f"Error subscribing to symbol: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/unsubscribe/", status_code=200)
@@ -84,5 +85,5 @@ async def unsubscribe_from_symbol(
     except HTTPException as e:
         raise e
     except Exception as e:
-        logging.error(f"Error unsubscribing from symbol: {e}")
+        log_exception(f"Error unsubscribing from symbol: {e}")
         raise HTTPException(status_code=500, detail=str(e))

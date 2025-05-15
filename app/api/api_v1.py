@@ -2,7 +2,7 @@ from fastapi import APIRouter
 import os
 print("Current Working Directory:", os.getcwd())
 
-from api.endpoints import feeds, historical_data, symbols, subscriptions
+from app.api.endpoints import feeds, historical_data, symbols, subscriptions
 
 api_router = APIRouter()
 

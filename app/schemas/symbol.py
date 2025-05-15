@@ -2,108 +2,118 @@ from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import date, datetime
 
+
 class SymbolBase(BaseModel):
-    instrument_key: str = Field(max_length=255)
-    Exchange: str = Field(max_length=50)
-    Stock_Code: str
-    Product_Type: Optional[str] = Field(None, max_length=50)
-    Expiry_Date: Optional[date] = None
-    Option_Type: Optional[str] = Field(None, max_length=50)
-    Strike_Price: Optional[float] = None
-    Stock_Token: str
-    Instrument_Name: Optional[str] = Field(None, max_length=255)
-    Series: Optional[str] = Field(None, max_length=50)
-    Ca_Level: Optional[str] = Field(None, max_length=50)
-    Permitted_To_Trade: Optional[bool] = None
-    Issue_Capital: Optional[float] = None
-    Warning_Qty: Optional[int] = None
-    Freeze_Qty: Optional[int] = None
-    Credit_Rating: Optional[str] = Field(None, max_length=50)
-    Normal_Market_Status: Optional[str] = Field(None, max_length=50)
-    Odd_Lot_Market_Status: Optional[str] = Field(None, max_length=50)
-    Spot_Market_Status: Optional[str] = Field(None, max_length=50)
-    Auction_Market_Status: Optional[str] = Field(None, max_length=50)
-    Normal_Market_Eligibility: Optional[str] = Field(None, max_length=50)
-    Odd_Lot_Market_Eligibility: Optional[str] = Field(None, max_length=50)
-    Spot_Market_Eligibility: Optional[str] = Field(None, max_length=50)
-    Auction_Market_Eligibility: Optional[str] = Field(None, max_length=50)
-    Scrip_Id: Optional[str] = Field(None, max_length=50)
-    Issue_Rate: Optional[float] = None
-    Issue_Start_Date: Optional[date] = None
-    Interest_Payment_Date: Optional[date] = None
-    Issue_Maturity_Date: Optional[date] = None
-    Margin_Percentage: Optional[float] = None
-    Minimum_Lot_Qty: Optional[int] = None
-    Lot_Size: Optional[int] = None
-    Tick_Size: Optional[float] = None
-    Company_Name: Optional[str] = Field(None, max_length=255)
-    Board_Lot_Qty: Optional[int] = None
-    Date_Of_Delisting: Optional[int] = None
-    Date_Of_Listing: Optional[date] = None
-    Face_Value: Optional[float] = None
-    Freeze_Percent: Optional[float] = None  
-    High_Date: Optional[date] = None
-    ISIN_Code: Optional[str] = Field(None, max_length=50)
-    Instrument_Type: Optional[str] = Field(None, max_length=50)
-    Issue_Price: Optional[float] = None
-    Life_Time_High: Optional[float] = None
-    Life_Time_Low: Optional[float] = None
-    Low_Date: Optional[date] = None
-    AVM_Buy_Margin: Optional[float] = None
-    AVM_Sell_Margin: Optional[float] = None
-    BCast_Flag: Optional[bool] = None
-    Group_Name: Optional[str] = Field(None, max_length=50)
-    Market_Lot: Optional[int] = None
-    NDE_Date: Optional[date] = None
-    NDS_Date: Optional[date] = None
-    Nd_Flag: Optional[bool] = None
-    Scrip_Code: Optional[str] = Field(None, max_length=50)
-    Scrip_Name: Optional[str] = Field(None, max_length=50)
-    Susp_Status: Optional[str] = Field(None, max_length=50)
-    Suspension_Reason: Optional[str] = Field(None, max_length=255)
-    Suspension_Date: Optional[date] = None
-    Listing_Date: Optional[date] = None
-    Expulsion_Date: Optional[date] = None
-    Readmission_Date: Optional[date] = None
-    Record_Date: Optional[date] = None
-    Low_Price_Range: Optional[float] = None
-    High_Price_Range: Optional[float] = None
-    Security_Expiry_Date: Optional[date] = None
-    No_Delivery_Start_Date: Optional[date] = None
-    No_Delivery_End_Date: Optional[date] = None
-    Mf: Optional[str] = Field(None, max_length=50)
-    Aon: Optional[str] = Field(None, max_length=50)
-    Participant_In_Market_Index: Optional[str] = Field(None, max_length=50)
-    Book_Cls_Start_Date: Optional[date] = None
-    Book_Cls_End_Date: Optional[date] = None
-    Excercise_Start_Date: Optional[date] = None
-    Excercise_End_Date: Optional[date] = None
-    Old_Token: Optional[str] = Field(None, max_length=255)
-    Asset_Instrument: Optional[str] = Field(None, max_length=255)
-    Asset_Name: Optional[str] = Field(None, max_length=255)
-    Asset_Token: Optional[int] = None
-    Intrinsic_Value: Optional[float] = None
-    Extrinsic_Value: Optional[float] = None
-    Excercise_Style: Optional[str] = Field(None, max_length=50)
-    Egm: Optional[str] = Field(None, max_length=50)
-    Agm: Optional[str] = Field(None, max_length=50)
-    Interest: Optional[str] = Field(None, max_length=50)
-    Bonus: Optional[str] = Field(None, max_length=50)
-    Rights: Optional[str] = Field(None, max_length=50)
-    Dividends: Optional[str] = Field(None, max_length=50)
-    Ex_Allowed: Optional[str] = Field(None, max_length=50)
-    Ex_Rejection_Allowed: Optional[bool] = None
-    Pl_Allowed: Optional[bool] = None
-    Is_This_Asset: Optional[bool] = None
-    Is_Corp_Adjusted: Optional[bool] = None
-    Local_Update_Datetime: Optional[datetime] = None
-    Delete_Flag: Optional[bool] = None
-    Remarks: Optional[str] = Field(None, max_length=255)
-    Base_Price: Optional[float] = None
-    Exchange_Code: Optional[str] = Field(None, max_length=50)
-    Breeze_Token: Optional[str] = Field(None, max_length=255)
-    Kite_Token: Optional[str] = Field(None, max_length=255)
-    first_added_datetime: Optional[date] = None
+    instrument_key: str
+    stock_token: Optional[str]
+    instrument_name: Optional[str] = Field(None, alias="Instrument_Name")
+    stock_code: Optional[str]
+    series: Optional[str]
+    expiry_date: Optional[datetime]
+    strike_price: Optional[float]
+    option_type: Optional[str]
+    ca_level: Optional[str]
+    permitted_to_trade: Optional[bool]
+    issue_capital: Optional[float]
+    warning_qty: Optional[int]
+    freeze_qty: Optional[int]
+    credit_rating: Optional[str]
+    normal_market_status: Optional[str]
+    odd_lot_market_status: Optional[str]
+    spot_market_status: Optional[str]
+    auction_market_status: Optional[str]
+    normal_market_eligibility: Optional[str]
+    odd_lot_market_eligibility: Optional[str]
+    spot_market_eligibility: Optional[str]
+    auction_market_eligibility: Optional[str]
+    scrip_id: Optional[str]
+    issue_rate: Optional[float]
+    issue_start_date: Optional[datetime]
+    interest_payment_date: Optional[datetime]
+    issue_maturity_date: Optional[datetime]
+    margin_percentage: Optional[float]
+    minimum_lot_qty: Optional[int]
+    lot_size: Optional[int]
+    tick_size: Optional[float]
+    company_name: Optional[str]
+    listing_date: Optional[datetime]
+    expulsion_date: Optional[datetime]
+    readmission_date: Optional[datetime]
+    record_date: Optional[datetime]
+    low_price_range: Optional[float]
+    high_price_range: Optional[float]
+    security_expiry_date: Optional[datetime]
+    no_delivery_start_date: Optional[datetime]
+    no_delivery_end_date: Optional[datetime]
+    aon: Optional[str]
+    participant_in_market_index: Optional[str]
+    book_cls_start_date: Optional[datetime]
+    book_cls_end_date: Optional[datetime]
+    excercise_start_date: Optional[datetime]
+    excercise_end_date: Optional[datetime]
+    old_token: Optional[str]
+    asset_instrument: Optional[str]
+    asset_name: Optional[str]
+    asset_token: Optional[int]
+    intrinsic_value: Optional[float]
+    extrinsic_value: Optional[float]
+    excercise_style: Optional[str]
+    egm: Optional[str]
+    agm: Optional[str]
+    interest: Optional[str]
+    bonus: Optional[str]
+    rights: Optional[str]
+    dividends: Optional[str]
+    ex_allowed: Optional[str]
+    ex_rejection_allowed: Optional[bool]
+    pl_allowed: Optional[bool]
+    is_this_asset: Optional[bool]
+    is_corp_adjusted: Optional[bool]
+    local_update_datetime: Optional[datetime]
+    delete_flag: Optional[bool]
+    remarks: Optional[str]
+    base_price: Optional[float]
+    exchange_code: Optional[str]
+    product_type: Optional[str]
+    breeze_token: Optional[str]
+    kite_token: Optional[str]
+    board_lot_qty: Optional[int]
+    date_of_delisting: Optional[datetime]
+    date_of_listing: Optional[datetime]
+    face_value: Optional[float]
+    freeze_percent: Optional[float]
+    high_date: Optional[datetime]
+    isin_code: Optional[str]
+    instrument_type: Optional[str]
+    issue_price: Optional[float]
+    lifetime_high: Optional[float]
+    lifetime_low: Optional[float]
+    low_date: Optional[datetime]
+    avm_buy_margin: Optional[float]
+    avm_sell_margin: Optional[float]
+    bcast_flag: Optional[bool]
+    group_name: Optional[str]
+    market_lot: Optional[int]
+    nde_date: Optional[datetime]
+    nds_date: Optional[datetime]
+    nd_flag: Optional[bool]
+    scrip_code: Optional[str]
+    scrip_name: Optional[str]
+    susp_status: Optional[str]
+    suspension_reason: Optional[str]
+    suspension_date: Optional[datetime]
+    refresh_flag: Optional[bool]
+    first_added_datetime: Optional[datetime]
+    weeks_52_high: Optional[float]
+    weeks_52_low: Optional[float]
+    symbol: Optional[str]
+    short_name: Optional[str]
+    mfill: Optional[str]
+
+    class Config:
+        orm_mode = True
+        allow_population_by_field_name = True
+
     
 class SymbolCreate(SymbolBase):
     pass

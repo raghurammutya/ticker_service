@@ -1,70 +1,78 @@
-from fastapi import FastAPI,Depends,HTTPException
+from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
-from shared_architecture.utils.service_helpers import connection_manager
-from sqlalchemy.orm import Session
-from services import broker_service 
-from core.config import Settings
-def get_timescaledb_session():
+from app.services import broker_service 
+from app.core.config import Settings
+
+# ✅ Updated imports from new shared_architecture API
+from shared_architecture.connections import (
+    get_timescaledb_session,
+    get_redis_connection,
+    get_rabbitmq_connection,
+    get_mongo_connection
+)
+
+# ✅ Dependency that yields a TimescaleDB session
+def get_timescaledb_session_dep():
     """
-    Yields a TimescaleDB session from the ConnectionManager.
+    Yields a TimescaleDB session.
     """
+    db: Session = get_timescaledb_session()
     try:
-        db: Session = connection_manager.get_timescaledb_session()
         yield db
     finally:
-        if db:
-            db.close()
+        db.close()
 
-def get_redis_client():
+
+# ✅ Dependency that yields a Redis client (async)
+async def get_redis_client():
     """
-    Yields a Redis client from the ConnectionManager.
+    Yields an async Redis client.
     """
-    redis_client = connection_manager.get_redis_connection()
+    redis = await get_redis_connection()
     try:
-        yield redis_client
+        yield redis
     finally:
-        if redis_client:
-            redis_client.close()
+        if redis:
+            await redis.close()
 
+
+# ✅ Dependency that yields a RabbitMQ channel
 def get_rabbitmq_connection():
     """
-    Yields a RabbitMQ connection from the ConnectionManager.
+    Yields a RabbitMQ connection/channel.
     """
-    rabbitmq_conn = connection_manager.get_rabbitmq_connection()
+    rabbitmq = get_rabbitmq_connection()
     try:
-        yield rabbitmq_conn
+        yield rabbitmq
     finally:
-        if rabbitmq_conn:
-            rabbitmq_conn.close()
+        rabbitmq.close()
 
+
+# ✅ Dependency that yields a MongoDB client
 def get_mongodb_client():
     """
-    Yields a MongoDB client from the ConnectionManager.
+    Yields a MongoDB client.
     """
-    mongodb_client = connection_manager.get_mongodb_connection()
+    mongo = get_mongo_connection()
     try:
-        yield mongodb_client
+        yield mongo
     finally:
-        if mongodb_client:
-            mongodb_client.close()
+        mongo.close()
 
 
-
+# ✅ FastAPI settings
 def get_settings():
     return Settings()
 
+
+# ✅ Broker instance from app.state
 def get_broker_instance(app: FastAPI):
-    """
-    Dependency to provide the initialized broker instance.
-    """
     if hasattr(app.state, "broker_instance"):
         return app.state.broker_instance
-    else:
-        raise HTTPException(status_code=500, detail="Broker instance not initialized in app.state")
-    
+    raise HTTPException(status_code=500, detail="Broker instance not initialized in app.state")
+
+
+# ✅ App reference
 def get_app():
-    """
-    Dependency to provide the FastAPI application instance.
-    """
-    from main import app  # Import app from main.py
+    from app.main import app  # Be cautious about circular imports if any
     return app

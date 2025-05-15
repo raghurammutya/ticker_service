@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from schemas import symbol as symbol_schema
-from services import broker_service, symbol_service
+from app.schemas import symbol as symbol_schema
+from app.services import broker_service, symbol_service
 from shared_architecture.db import get_db
 from typing import List
 

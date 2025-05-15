@@ -4,29 +4,34 @@ import pandas as pd
 import numpy as np
 import logging
 import threading
-from datetime import datetime, timedelta,date
+from datetime import datetime, timedelta,date,timezone
 from typing import List,Union, Dict, Any,Optional,Type,Callable
-from schemas import symbol as symbol_schema
-from models import symbol as symbol_model
-from schemas import historical_data as historical_data_schema
-from services import rabbitmq_service
-from services.redis_service import RedisService
-
-from models import tick_data as tick_data_model
+from app.schemas import symbol as symbol_schema
+from shared_architecture.db.models.symbol import Symbol as symbol_model
+from shared_architecture.utils.other_helpers import safe_parse_datetime,safe_int_conversion,safe_convert,safe_parse_date,safe_convert_bool,safe_convert_int,safe_convert_float  # Import the library
+from app.schemas import historical_data as historical_data_schema
+from app.services import rabbitmq_service
+from shared_architecture.utils.datetime_utils import utc_now
+from app.services.market_data_manager import MarketDataManager 
+from shared_architecture.utils.logging_utils import log_info, log_warning, log_exception
+from app.utils.instrument_key_helper import get_instrument_key
+from shared_architecture.db.models import tick_data as tick_data_model
 from sqlalchemy.orm import Session
+from shared_architecture.connections import get_timescaledb_session
 import aiohttp
 import pytz
 from zoneinfo import ZoneInfo
-from core.config import Settings
+from app.core.config import Settings
 from sqlalchemy import inspect
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from breeze_connect import BreezeConnect
-from utils.data_utils import safe_parse_datetime,safe_convert,safe_convert_bool,safe_convert_int,safe_convert_float  # Import the library
+from breeze_connect import BreezeConnect  # Import the library
 from dateutil import parser
 import json
 import time as t
-from core.dependencies import get_app
+from sqlalchemy import func, select, update, insert
+from app.core.dependencies import get_app
+from shared_architecture.db.timescaledb_bulk_utils import bulk_upsert_async
 class Broker:
     def __init__(self, broker_record):
         """
@@ -65,7 +70,7 @@ class Broker:
         """
         try:
             if self.simulation_task and not self.simulation_task.done():
-                logging.warning("Simulation is already running.")
+                log_warning("Simulation is already running.")
                 return {"message": "Simulation is already running."}
 
             async def simulate_ticks():
@@ -73,15 +78,15 @@ class Broker:
                     for instrument_key in self.instrument_keys:
                         tick_data = self._generate_mock_tick(instrument_key)
                         await self._handle_tick_data(tick_data)  # Handle the tick data
-                        logging.info(f"Mock: Sent tick for {instrument_key}")
+                        log_info(f"Mock: Sent tick for {instrument_key}")
                         await asyncio.sleep(interval)  # Wait for the interval
 
-            logging.info("Starting tick simulation...")
+            log_info("Starting tick simulation...")
             self.simulation_task = asyncio.create_task(simulate_ticks())
             return {"message": "Tick simulation started."}
 
         except Exception as e:
-            logging.error(f"Error in start_simulation: {e}")
+            log_exception(f"Error in start_simulation: {e}")
             raise
 
     async def stop_simulation(self):
@@ -94,18 +99,16 @@ class Broker:
                 try:
                     await self.simulation_task  # Wait for cancellation
                 except asyncio.CancelledError:
-                    logging.info("Simulation task canceled successfully.")
+                    log_info("Simulation task canceled successfully.")
                 self.simulation_task = None  # Reset the task
                 return {"message": "Tick simulation stopped."}
             else:
-                logging.warning("No active simulation to stop.")
+                log_warning("No active simulation to stop.")
                 return {"message": "No active simulation to stop."}
 
         except Exception as e:
-            logging.error(f"Error in stop_simulation: {e}")
+            log_exception(f"Error in stop_simulation: {e}")
             raise
-
-
 
     async def _initialize_connection(self):
         """
@@ -123,12 +126,13 @@ class Broker:
                 session_token=self.broker_record.session_token
             )
             self.broker_session = True  # Setting to True as it is used for checking.
-            logging.info("Breeze: Connection initialized successfully.")
+            self.market_data_manager = MarketDataManager(self.redis_service)
+            log_info("Breeze: Connection initialized successfully.")
             self.broker.ws_connect()
             self.broker.on_ticks = self._handle_tick_data_sync
-            logging.info(f"Breeze: Ready to receive real time feeds")
+            log_info(f"Breeze: Ready to receive real time feeds")
         except Exception as e:
-            logging.error(f"Breeze: Failed to initialize connection: {e}")
+            log_exception(f"Breeze: Failed to initialize connection: {e}")
             raise
     def get_model_column_names(self,model_class):
         """
@@ -153,9 +157,9 @@ class Broker:
                 self.broker.ws_disconnect()  # If BreezeConnect has a logout method
             self.broker = None
             self.broker_session = None
-            logging.info("Breeze: Connection closed.")
+            log_info("Breeze: Connection closed.")
         except Exception as e:
-            logging.error(f"Breeze: Failed to disconnect: {e}")
+            log_exception(f"Breeze: Failed to disconnect: {e}")
 
     async def get_symbols(self) -> List[symbol_schema.SymbolCreate]:
         """
@@ -167,41 +171,60 @@ class Broker:
                 downloaded_file = await self._download_file(self.symbol_url, symbol_target_dir)
                 if downloaded_file:
                     await self._extract_zip(downloaded_file, symbol_target_dir)
-                    logging.info("Breeze: Downloaded and extracted symbol files.")
+                    log_info("Breeze: Downloaded and extracted symbol files.")
 
             # Process files in parallel
             files_to_process = ["FONSEScripMaster.txt", "FOBSEScripMaster.txt", "NSEScripMaster.txt", "BSEScripMaster.txt"]
             file_paths = [os.path.join(symbol_target_dir, file) for file in files_to_process]
-            loop = asyncio.get_event_loop()
-            tasks = [loop.run_in_executor(self.executor, self._process_data_file, file_path) for file_path in file_paths]
+            tasks = [self._process_data_file(file_path) for file_path in file_paths]
             results = await asyncio.gather(*tasks)
-            symbols = []
-            for result in results:
-                symbols.extend(result)
 
-            return symbols
-            #symbols = [symbol_schema.SymbolCreate(**row) for row in all_symbols_data.to_dict(orient='records')]
+            # symbols = [item for result in results for item in result]  # Flatten list
 
-            #return symbols
+
+
+            # # loop = asyncio.get_event_loop()
+            # # tasks = [loop.run_in_executor(self.executor, self._process_data_file, file_path) for file_path in file_paths]
+            # # results = await asyncio.gather(*tasks)
+            # symbols = []
+            # for result in results:
+            #     symbols.extend(result)
+            # log_info("Prepared Symbol data. Next loading...")
+            
+            # symbols_df = pd.DataFrame(symbols)
+            # # Ensure integer fields are properly converted
+            # integer_columns = ["Warning_Qty", "Freeze_Qty", "Minimum_Lot_Qty", "Asset_Token"]
+
+            # # Convert these columns to integer, replacing non-convertible values with default (e.g., 0)
+            # for col in integer_columns:
+            #     symbols_df[col] = pd.to_numeric(symbols_df[col], errors="coerce").fillna(0).astype(int)
+            #         # Prepare data for upsert
+            # now = utc_now()
+            # symbols_df["localupdatedatetime"] = now
+            # symbols_df["first_added_datetime"] = now
+            # # Now, convert DataFrame to list of dictionaries safely
+            # symbols = [symbol_schema.SymbolCreate(**row) for row in symbols_df.to_dict(orient="records")]
+            
+            # return symbols
 
         except Exception as e:
-            logging.error(f"Breeze: Error getting symbols: {e}")
+            log_exception(f"Breeze: Error getting symbols: {e}")
             raise
-
-    def _process_data_file(self, filepath) -> pd.DataFrame:
+    async def _process_data_file(self, filepath) -> pd.DataFrame:
         """
         Processes a single symbol data file.
         """
         try:
             def generate_instrument_key(row):
                 """Generates instrument_key based on the Product_Type and other columns."""
-                if row['Product_Type'] == 'futures':
-                    return f"{row['Exchange']}@{row['Stock_Code']}@{row['Product_Type']}@{row['Expiry_Date']}"
-                elif row['Product_Type'] == 'options':
-                    return f"{row['Exchange']}@{row['Stock_Code']}@{row['Product_Type']}@{row['Expiry_Date']}@{row['Option_Type']}@{row['Strike_Price']}"
-                elif row['Product_Type'] == 'equities':
-                    return f"{row['Exchange']}@{row['Stock_Code']}@{row['Product_Type']}"
-
+                
+                if row['product_type'] == 'futures':
+                    instrument_key= f"{row['exchange']}@{row['stock_code']}@{row['product_type']}@{row['expiry_date']}"
+                elif row['product_type'] == 'options':
+                    instrument_key= f"{row['exchange']}@{row['stock_code']}@{row['product_type']}@{row['expiry_date']}@{row['option_type']}@{row['strike_price']}"
+                elif row['product_type'] == 'equities':
+                    instrument_key= f"{row['exchange']}@{row['stock_code']}@{row['product_type']}"
+                return instrument_key
             # Apply the function once across the DataFrame
 
             logging.info(f"Breeze: Starting process of {filepath}")
@@ -217,9 +240,9 @@ class Broker:
                 "Expulsion_Date", "Readmission_Date", "Record_Date", "Low_Price_Range",
                 "High_Price_Range", "Security_Expiry_Date", "No_Delivery_Start_Date",
                 "No_Delivery_End_Date", "Mf", "Aon", "Participant_In_Market_Index",
-                "Book_Cls_Start_Date", "Book_Cls_End_Date", "Exercise_Start_Date", "Exercise_End_Date",
+                "Book_Cls_Start_Date", "Book_Cls_End_Date", "Excercise_Start_Date", "Excercise_End_Date",
                 "Old_Token", "Asset_Instrument", "Asset_Name", "Asset_Token", "Intrinsic_Value",
-                "Extrinsic_Value", "Exercise_Style", "Egm", "Agm", "Interest", "Bonus", "Rights",
+                "Extrinsic_Value", "Excercise_Style", "Egm", "Agm", "Interest", "Bonus", "Rights",
                 "Dividends", "Ex_Allowed", "Ex_Rejection_Allowed", "Pl_Allowed", "Is_This_Asset","Board_Lot_Qty", 
                 "Date_Of_Delisting","Date_Of_Listing","Face_Value","Freeze_Percent","High_Date","ISIN_Code",
                 "Instrument_Type","Issue_Price","Life_Time_High","Life_Time_Low","Low_Date", 	"AVM_Buy_Margin",
@@ -239,31 +262,33 @@ class Broker:
                 symbols.rename(columns=rename_dict, inplace=True)
 
                 Exchange = 'NFO'
-                symbols['Exchange'] = Exchange
-                symbols['Product_Type'] = np.where(symbols['Series'] == 'FUTURE', 'futures',
-                                                np.where(symbols['Series'] == 'OPTION', 'options', symbols['Series']))
-                symbols['Option_Type'] = np.where(symbols['Option_Type'] == 'CE', 'call',
-                                                np.where(symbols['Option_Type'] == 'PE', 'put', symbols['Option_Type']))
-                symbols = symbols.rename(columns={'ShortName': 'Stock_Code'})
-                symbols = symbols.rename(columns={'Token': 'Breeze_Token'})
-                required_columns = ["Exchange_Code", "Product_Type", "Stock_Code", "Expiry_Date", "Option_Type", "Strike_Price"]
+                symbols['exchange'] = Exchange
+                symbols['product_type'] = np.where(symbols['series'] == 'FUTURE', 'futures',
+                                                np.where(symbols['series'] == 'OPTION', 'options', symbols['series']))
+                symbols['option_type'] = np.where(symbols['option_type'] == 'CE', 'call',
+                                                np.where(symbols['option_type'] == 'PE', 'put', symbols['option_type']))
+                symbols = symbols.rename(columns={'short_name': 'stock_code'})
+                symbols = symbols.rename(columns={'Token': 'breeze_token'})
+                symbols = symbols.rename(columns={'strikeprice': 'strike_price'})
+                symbols = symbols.rename(columns={'expirydate': 'expiry_date'})
+                required_columns = ["exchange", "product_type", "stock_code", "expiry_date", "option_type", "strike_price"]
                 if not set(required_columns).issubset(symbols.columns):
                     raise KeyError(f"Missing columns: {set(required_columns) - set(symbols.columns)}")
 
-                if 'Expiry_Date' in symbols:
-                    symbols['Expiry_Date'] = symbols['Expiry_Date'].fillna('')
+                if 'expiry_date' in symbols:
+                    symbols['expiry_date'] = symbols['expiry_date'].fillna('')
 
-                if 'Option_Type' in symbols:
-                    symbols['Option_Type'] = symbols['Option_Type'].fillna('')
+                if 'option_type' in symbols:
+                    symbols['option_type'] = symbols['option_type'].fillna('')
 
-                if 'Strike_Price' in symbols:
-                    symbols['Strike_Price'] = symbols['Strike_Price'].fillna('')
-                symbols['Strike_Price'] = symbols['Strike_Price'].astype(str).str.replace(r'\.0', '', regex=True)
-                symbols['Strike_Price'] = pd.to_numeric(symbols['Strike_Price'], errors='coerce')
+                if 'strike_price' in symbols:
+                    symbols['strike_price'] = symbols['strike_price'].fillna('')
+                symbols['strike_price'] = symbols['strike_price'].astype(str).str.replace(r'\.0', '', regex=True)
+                symbols['strike_price'] = pd.to_numeric(symbols['strike_price'], errors='coerce')
                 symbols['instrument_key'] = symbols.apply(generate_instrument_key, axis=1)
 
 
-                symbols = symbols.sort_values(by=['Stock_Code', 'Product_Type', 'Expiry_Date', 'Option_Type', 'Strike_Price'])
+                symbols = symbols.sort_values(by=['stock_code', 'product_type', 'expiry_date', 'option_type', 'strike_price'])
 
             elif "NSEScripMaster.txt" in filepath:
                 symbols = pd.read_csv(filepath, header=0)
@@ -273,11 +298,12 @@ class Broker:
                 #rename_dict = {col: self.to_snake_case(col).replace(" ","_") for col in symbols.columns}
                 symbols.rename(columns=rename_dict, inplace=True)
                 Exchange = 'NSE'
-                symbols['Exchange'] = Exchange
-                symbols['Product_Type'] = 'equities'
-                symbols = symbols.rename(columns={'ShortName': 'Stock_Code'})
+                symbols['exchange'] = Exchange
+                symbols['product_type'] = 'equities'
+                symbols = symbols.rename(columns={'short_name': 'stock_code'})
                 symbols = symbols.rename(columns={'Token': 'Breeze_Token'})
-                required_columns = ["Exchange_Code", "Product_Type", "Stock_Code"]
+                
+                required_columns = ["exchange", "product_type", "stock_code"]
                 if not set(required_columns).issubset(symbols.columns):
                     raise KeyError(f"Missing columns: {set(required_columns) - set(symbols.columns)}")
 
@@ -292,11 +318,11 @@ class Broker:
                 symbols.rename(columns=rename_dict, inplace=True)
                 
                 Exchange = 'BSE'
-                symbols['Exchange'] = Exchange
-                symbols = symbols.rename(columns={'ShortName': 'Stock_Code'})
+                symbols['exchange'] = Exchange
+                symbols = symbols.rename(columns={'short_name': 'stock_code'})
                 symbols = symbols.rename(columns={'Token': 'Breeze_Token'})
-                symbols['Product_Type'] = 'equities'
-                required_columns = ["Exchange", "Product_Type", "Stock_Code"]
+                symbols['product_type'] = 'equities'
+                required_columns = ["exchange", "product_type", "stock_code"]
                 if not set(required_columns).issubset(symbols.columns):
                     raise KeyError(f"Missing columns: {set(required_columns) - set(symbols.columns)}")
 
@@ -311,68 +337,79 @@ class Broker:
                 symbols.rename(columns=rename_dict, inplace=True)
                 Exchange = 'BSO'
 
-                symbols['Exchange'] = Exchange
-                symbols['Product_Type'] = np.where(symbols['Series'] == 'FUTURE', 'futures',
-                                                np.where(symbols['Series'] == 'OPTION', 'options', symbols['Series']))
-                symbols['Option_Type'] = np.where(symbols['Option_Type'] == 'CE', 'call',
-                                                np.where(symbols['Option_Type'] == 'PE', 'put', symbols['Option_Type']))
-                symbols = symbols.rename(columns={'ShortName': 'Stock_Code'})
+                symbols['exchange'] = Exchange
+                symbols['product_type'] = np.where(symbols['series'] == 'FUTURE', 'futures',
+                                                np.where(symbols['series'] == 'OPTION', 'options', symbols['series']))
+                symbols['option_type'] = np.where(symbols['option_type'] == 'CE', 'call',
+                                                np.where(symbols['option_type'] == 'PE', 'put', symbols['option_type']))
+                symbols = symbols.rename(columns={'short_name': 'stock_code'})
                 symbols = symbols.rename(columns={'Token': 'Breeze_Token'})
-                required_columns = ["Exchange_Code", "Product_Type", "Stock_Code", "Expiry_Date", "Option_Type", "Strike_Price"]
+                symbols = symbols.rename(columns={'expirydate': 'expiry_date'})
+                #symbols = symbols.rename(columns={'rights': 'option_type'})
+                symbols = symbols.rename(columns={'strikeprice': 'strike_price'})
+                required_columns = ["exchange", "product_type", "stock_code", "expiry_date", "option_type", "strike_price"]
                 if not set(required_columns).issubset(symbols.columns):
                     raise KeyError(f"Missing columns: {set(required_columns) - set(symbols.columns)}")
-                if 'Expiry_Date' in symbols:
-                    symbols['Expiry_Date'] = symbols['Expiry_Date'].fillna('')
+                if 'expiry_date' in symbols:
+                    symbols['expiry_date'] = symbols['expiry_date'].fillna('')
 
-                if 'Option_Type' in symbols:
-                    symbols['Option_Type'] = symbols['Option_Type'].fillna('')
+                if 'option_type' in symbols:
+                    symbols['option_type'] = symbols['option_type'].fillna('')
 
-                if 'Strike_Price' in symbols:
-                    symbols['Strike_Price'] = symbols['Strike_Price'].fillna('')
-                symbols['Strike_Price'] = symbols['Strike_Price'].astype(str).str.replace(r'\.0', '', regex=True)
-                symbols['Strike_Price'] = pd.to_numeric(symbols['Strike_Price'], errors='coerce')
+                if 'strike_price' in symbols:
+                    symbols['strike_price'] = symbols['strike_price'].fillna('')
+                symbols['strike_price'] = symbols['strike_price'].astype(str).str.replace(r'\.0', '', regex=True)
+                symbols['strike_price'] = pd.to_numeric(symbols['strike_price'], errors='coerce')
                 symbols['instrument_key'] = symbols.apply(generate_instrument_key, axis=1)
 
                 
-                symbols = symbols.sort_values(by=['Stock_Code', 'Product_Type', 'Expiry_Date', 'Option_Type', 'Strike_Price'])
+                symbols = symbols.sort_values(by=['stock_code', 'product_type', 'expiry_date', 'option_type', 'strike_price'])
 
             else:
                 logging.warning(f"Breeze: Unsupported file: {filepath}")
                 return pd.DataFrame()
 
             symbols = symbols.replace(np.nan, None)
+            symbols = symbols.rename(columns={'52_weeks_high': 'weeks_52_high'})
+            symbols = symbols.rename(columns={'52_weeks_low': 'weeks_52_low'})
+            symbols['short_name']=symbols['stock_code']
+            #ist = pytz.timezone("Asia/Kolkata")
+            #symbols["local_update_datetime"] = utc_now()
+            symbols['first_added_datetime']= datetime.now()
+
+
+
             # Check for empty instrument_key (Added code)
             empty_key_rows = symbols[symbols['instrument_key'] == '']
             if not empty_key_rows.empty:
                 logging.warning(f"Breeze: Found {len(empty_key_rows)} rows with empty instrument_key in {filepath}")
-                print(f"Rows with empty instrument_key in {filepath}:\n{empty_key_rows}")
 
             # inspector = inspect(self.db.bind) #This is not available here.
-            processed_symbols = pd.DataFrame()
-            new_series = []
-            for col in db_columns:
-                if col in symbols.columns:
-                    new_series.append(pd.Series([None] * len(symbols), index=symbols.index, name=col))
-                    #processed_symbols[col] = symbols[col]  # Copy the existing column
-                else:
-                    # Concatenate the new Series with the original DataFrame
-                    if new_series:
-                        symbols = pd.concat([symbols] + new_series, axis=1)
-                    #processed_symbols[col] = pd.Series([None] * len(symbols), index=symbols.index) # Create a new Series
-                # Reindex for consistency (optional, but often recommended)
-                symbols = symbols.reindex(columns=db_columns, fill_value=None)
-            processed_symbols=symbols
-            for col in processed_symbols.select_dtypes(include=['object']).columns:
-                if processed_symbols[col].dtype == 'object':
-                    processed_symbols[col] = processed_symbols[col].str.strip("'")
+            # processed_symbols = pd.DataFrame()
+            # new_series = []
+            # for col in db_columns:
+            #     if col in symbols.columns:
+            #         new_series.append(pd.Series([None] * len(symbols), index=symbols.index, name=col))
+            #         #processed_symbols[col] = symbols[col]  # Copy the existing column
+            #     else:
+            #         # Concatenate the new Series with the original DataFrame
+            #         if new_series:
+            #             symbols = pd.concat([symbols] + new_series, axis=1)
+            #         #processed_symbols[col] = pd.Series([None] * len(symbols), index=symbols.index) # Create a new Series
+            #     # Reindex for consistency (optional, but often recommended)
+            #     symbols = symbols.reindex(columns=db_columns, fill_value=None)
+            # processed_symbols=symbols
+            # for col in processed_symbols.select_dtypes(include=['object']).columns:
+            #     if processed_symbols[col].dtype == 'object':
+            #         processed_symbols[col] = processed_symbols[col].str.strip("'")
 
 
 
             # Date Conversions
-            if 'Expiry_Date' in symbols.columns:
-                symbols['Expiry_Date'] = pd.to_datetime(symbols['Expiry_Date'], errors='coerce')
-                symbols['Expiry_Date'] = symbols['Expiry_Date'].dt.tz_localize('Asia/Kolkata').dt.date
-            symbols['Local_Update_Datetime']= datetime.now()
+            if 'expiry_date' in symbols.columns:
+                symbols['expiry_date'] = pd.to_datetime(symbols['expiry_date'], errors='coerce')
+                symbols['expiry_date'] = symbols['expiry_date'].dt.tz_localize('Asia/Kolkata').dt.date
+            symbols['local_update_datetime']= datetime.now()
 
             # Boolean Conversions
             boolean_columns = [
@@ -388,12 +425,33 @@ class Broker:
                 symbol_dict = row.to_dict()  # Convert each row to a dictionary
                 processed_row = self.process_data_row(symbol_dict) #Process the row
                 symbols_list.append(processed_row)
-
-            return symbols_list
+            await self._load_to_timescaledb_async(symbols_list) 
+            return None
         except Exception as e:
-            logging.error(f"Breeze: Error processing data file {filepath}: {e}")
+            log_exception(f"Breeze: Error processing data file {filepath}: {e}")
 
-            return pd.DataFrame()
+    async def _load_to_timescaledb_async(self, symbols_list):  
+        # Mark old symbols as inactive
+        stmt = update(symbol_model).values({
+            symbol_model.refresh_flag: True,
+            symbol_model.remarks: "Inactive"
+        })
+        SessionLocal = get_timescaledb_session()
+        async with SessionLocal() as db1:
+            await db1.execute(stmt)
+            await db1.commit()
+        for row in symbols_list:
+            if str(row.get("stock_token", "")).strip().lower() in ("nan", "none", ""):
+                row["stock_token"] = None
+        # Perform bulk upsert using shared utility
+        await bulk_upsert_async(
+            model=symbol_model,
+            data_list=symbols_list,
+            key_fields=["instrument_key"],
+            session_factory=get_timescaledb_session  # ✅ pass the function, not get_timescaledb_session()
+            )
+
+        logging.info("Symbols refreshed successfully.")
 
     def rename_columns_from_list(self, target_columns: List[str]) -> Dict[str, str]:
         """
@@ -407,7 +465,7 @@ class Broker:
         Returns:
             A dictionary where keys are original column names and values are new column names.
         """
-        column_list = self.get_model_column_names(symbol_model.Symbol)
+        column_list = self.get_model_column_names(symbol_model)
         rename_dict: Dict[str, str] = {}  # Initialize an empty dictionary
 
         for original_col in column_list:
@@ -423,207 +481,120 @@ class Broker:
             rename_dict["OddLotlMarketEligibility"] = "Odd_Lot_Market_Eligibility"
         return rename_dict
 
-
     def process_data_row(self,row: Dict[str, Any]) -> Dict[str, Any]:
         """
         Processes a single data row to match the Symbol schema.
         """
         processed_row: Dict[str, Any] = {}
 
-        # def safe_convert(value: Any, target_type: Type, default: Optional[Any] = None):
-        #     """
-        #     Safely converts a value to the target type, handling None and potential conversion errors.
-        #     """
-        #     if value is None:
-        #         return default
-        #     try:
-        #         return target_type(value)
-        #     except (ValueError, TypeError):
-        #         return default
-        #     except Exception as e:
-        #         print(f"Unexpected error during conversion: {e}")
-        #         return default
-            
-        # def safe_convert_int(value: Any, default: Optional[int] = None) -> Optional[int]:
-        #     """
-        #     Safely converts a value to an integer, handling None and potential errors.
-
-        #     Args:
-        #         value: The value to convert.
-        #         default: The value to return if conversion fails or if value is None.
-
-        #     Returns:
-        #         The converted integer, or the default if conversion fails or value is None.
-        #     """
-        #     if value is None:
-        #         return default
-        #     try:
-        #         return int(value)
-        #     except (ValueError, TypeError):
-        #         return default
-        #     except Exception as e:
-        #         print(f"Unexpected error converting to int: {e}")  # Log unexpected errors
-        #         return default
-        # def safe_convert_float(value: Any, default: Optional[float] = None) -> Optional[float]:
-        #     """
-        #     Safely converts a value to a float, handling None and potential errors.
-
-        #     Args:
-        #         value: The value to convert.
-        #         default: The value to return if conversion fails or if value is None.
-
-        #     Returns:
-        #         The converted float, or the default if conversion fails or value is None.
-        #     """
-        #     if value is None:
-        #         return default
-        #     try:
-        #         return float(value)
-        #     except (ValueError, TypeError):
-        #         return default
-        #     except Exception as e:
-        #         print(f"Unexpected error converting to float: {e}")  # Log unexpected errors
-        #         return default
-        # def safe_convert_bool(value: Any, default: Optional[bool] = None) -> Optional[bool]:
-        #     """
-        #     Safely converts a value to a boolean, handling None and various representations.
-
-        #     Args:
-        #         value: The value to convert.
-        #         default: The value to return if conversion fails or if value is None.
-
-        #     Returns:
-        #         The converted boolean, or the default if conversion fails or value is None.
-        #     """
-        #     if value is None:
-        #         return default
-        #     if isinstance(value, (int, float)):
-        #         return bool(value)  # 0 -> False, non-zero -> True
-        #     elif isinstance(value, str):
-        #         if value.lower() in ("true", "1", "yes"):
-        #             return True
-        #         elif value.lower() in ("false", "0", "no"):
-        #             return False
-        #         else:
-        #             return default  # Return default for invalid strings
-        #     else:
-        #         try:
-        #             return bool(value)  # General boolean conversion
-        #         except (ValueError, TypeError):
-        #             return default
-        #         except Exception as e:
-        #             print(f"Unexpected error converting to bool: {e}")
-        #             return default
-        # def safe_parse_datetime(date_input: Union[str, datetime, date, pd.Timestamp]) -> Optional[datetime]:
-        #     """
-        #     Safely parses a string or datetime-like object into a datetime object.
-        #     Handles pd.NaT.
-        #     """
-        #     if date_input is None or pd.isna(date_input):
-        #         return None
-        #     if isinstance(date_input, datetime):
-        #         return date_input
-        #     if isinstance(date_input, date):
-        #         return datetime(date_input.year, date_input.month, date_input.day)
-        #     if isinstance(date_input, str):
-        #         formats = [
-        #             '%Y-%m-%d %H:%M:%S.%f',
-        #             '%Y-%m-%d %H:%M:%S',
-        #             '%Y-%m-%d',
-        #             '%d-%b-%Y',
-        #             '%d-%m-%Y %H:%M:%S',
-        #             '%d/%m/%Y',
-        #             '%m/%d/%Y',
-        #             '%Y/%m/%d',
-        #             '%Y%m%d',
-        #             '%d%m%Y'
-        #         ]
-        #         for fmt in formats:
-        #             try:
-        #                 return datetime.strptime(date_input, fmt)
-        #             except ValueError:
-        #                 pass  # Try the next format
-        #     return None
-
         schema_fields: Dict[str, Type] = {
             "instrument_key": str,
-            "Stock_Token": str,
-            "Instrument_Name": str,
-            "Exchange":str,
-            "Stock_Code": str,
-            "Product_Type": str,
-            "Expiry_Date": safe_parse_datetime,
-            "Option_Type": str,
-            "Strike_Price": safe_convert_float,
-            "Series": str,
-            "Ca_Level": str,
-            "Permitted_To_Trade": safe_convert_bool,  # Use safe_convert_bool
-            "Issue_Capital": safe_convert_float,    # Use safe_convert_float
-            "Warning_Qty": safe_convert_int,      # Use safe_convert_int
-            "Freeze_Qty": safe_convert_int,        # Use safe_convert_int
-            "Credit_Rating": str,
-            "Normal_Market_Status": str,
-            "Odd_Lot_Market_Status": str,
-            "Spot_Market_Status": str,
-            "Auction_Market_Status": str,
-            "Normal_Market_Eligibility": str,
-            "Odd_Lot_Market_Eligibility": str,
-            "Spot_Market_Eligibility": str,
-            "Auction_Market_Eligibility": str,
-            "Scrip_Id": str,
-            "Issue_Rate": safe_convert_float,    # Use safe_convert_float
-            "Issue_Start_Date": safe_parse_datetime,
-            "Interest_Payment_Date": safe_parse_datetime,
-            "Issue_Maturity_Date": safe_parse_datetime,
-            "Margin_Percentage": safe_convert_float,  # Use safe_convert_float
-            "Minimum_Lot_Qty": safe_convert_int,    # Use safe_convert_int
-            "Lot_Size": safe_convert_int,          # Use safe_convert_int
-            "Tick_Size": safe_convert_float,      # Use safe_convert_float
-            "Company_Name": str,
-            "Listing_Date": safe_parse_datetime,
-            "Expulsion_Date": safe_parse_datetime,
-            "Readmission_Date": safe_parse_datetime,
-            "Record_Date": safe_parse_datetime,
-            "Low_Price_Range": safe_convert_float,  # Use safe_convert_float
-            "High_Price_Range": safe_convert_float, # Use safe_convert_float
-            "Security_Expiry_Date": safe_parse_datetime,
-            "No_Delivery_Start_Date": safe_parse_datetime,
-            "No_Delivery_End_Date": safe_parse_datetime,
-            "Mf": str,
-            "Aon": str,
-            "Participant_In_Market_Index": str,
-            "Book_Cls_Start_Date": safe_parse_datetime,
-            "Book_Cls_End_Date": safe_parse_datetime,
-            "Excercise_Start_Date": safe_parse_datetime,
-            "Excercise_End_Date": safe_parse_datetime,
-            "Old_Token": str,
-            "Asset_Instrument": str,
-            "Asset_Name": str,
-            "Asset_Token": safe_convert_int,      # Use safe_convert_int
-            "Intrinsic_Value": safe_convert_float,  # Use safe_convert_float
-            "Extrinsic_Value": safe_convert_float,  # Use safe_convert_float
-            "Excercise_Style": str,
-            "Egm": str,
-            "Agm": str,
-            "Interest": str,
-            "Bonus": str,
-            "Rights": str,
-            "Dividends": str,
-            "Ex_Allowed": str,
-            "Ex_Rejection_Allowed": safe_convert_bool, # Use safe_convert_bool
-            "Pl_Allowed": safe_convert_bool,         # Use safe_convert_bool
-            "Is_This_Asset": safe_convert_bool,     # Use safe_convert_bool
-            "Is_Corp_Adjusted": safe_convert_bool,  # Use safe_convert_bool
-            "Local_Update_Datetime": safe_parse_datetime,
-            "Delete_Flag": safe_convert_bool,       # Use safe_convert_bool
-            "Remarks": str,
-            "Base_Price": safe_convert_float,      # Use safe_convert_float
-            "Exchange_Code": str,
-            "Refresh_Flag": safe_convert_bool,
-            "Breeze_Token": str,
-            "Kite_Token": str,
+            "stock_token": str,
+            "instrument_name": str,
+            "stock_code": str,
+            "series": str,
+            "expiry_date": safe_parse_datetime,
+            "strike_price": safe_convert_float,
+            "option_type": str,
+            "ca_level": str,
+            "permitted_to_trade": safe_convert_bool,
+            "issue_capital": safe_convert_float,
+            "warning_qty": safe_convert_int,
+            "freeze_qty": safe_convert_int,
+            "credit_rating": str,
+            "normal_market_status": str,
+            "odd_lot_market_status": str,
+            "spot_market_status": str,
+            "auction_market_status": str,
+            "normal_market_eligibility": str,
+            "odd_lot_market_eligibility": str,
+            "spot_market_eligibility": str,
+            "auction_market_eligibility": str,
+            "scrip_id": str,
+            "issue_rate": safe_convert_float,
+            "issue_start_date": safe_parse_datetime,
+            "interest_payment_date": safe_parse_datetime,
+            "issue_maturity_date": safe_parse_datetime,
+            "margin_percentage": safe_convert_float,
+            "minimum_lot_qty": safe_convert_int,
+            "lot_size": safe_convert_int,
+            "tick_size": safe_convert_float,
+            "company_name": str,
+            "listing_date": safe_parse_datetime,
+            "expulsion_date": safe_parse_datetime,
+            "readmission_date": safe_parse_datetime,
+            "record_date": safe_parse_datetime,
+            "low_price_range": safe_convert_float,
+            "high_price_range": safe_convert_float,
+            "security_expiry_date": safe_parse_datetime,
+            "no_delivery_start_date": safe_parse_datetime,
+            "no_delivery_end_date": safe_parse_datetime,
+            "aon": str,
+            "participant_in_market_index": str,
+            "book_cls_start_date": safe_parse_datetime,
+            "book_cls_end_date": safe_parse_datetime,
+            "excercise_start_date": safe_parse_datetime,
+            "excercise_end_date": safe_parse_datetime,
+            "old_token": str,
+            "asset_instrument": str,
+            "asset_name": str,
+            "asset_token": safe_convert_int,
+            "intrinsic_value": safe_convert_float,
+            "extrinsic_value": safe_convert_float,
+            "excercise_style": str,
+            "egm": str,
+            "agm": str,
+            "interest": str,
+            "bonus": str,
+            "rights": str,
+            "dividends": str,
+            "ex_allowed": str,
+            "ex_rejection_allowed": safe_convert_bool,
+            "pl_allowed": safe_convert_bool,
+            "is_this_asset": safe_convert_bool,
+            "is_corp_adjusted": safe_convert_bool,
+            "local_update_datetime": safe_parse_datetime,
+            "delete_flag": safe_convert_bool,
+            "remarks": str,
+            "base_price": safe_convert_float,
+            "exchange_code": str,
+            "product_type": str,
+            "option_type_alt": str,
+            "breeze_token": str,
+            "kite_token": str,
+            "board_lot_qty": safe_convert_int,
+            "date_of_delisting": safe_parse_datetime,
+            "date_of_listing": safe_parse_datetime,
+            "face_value": safe_convert_float,
+            "freeze_percent": safe_convert_float,
+            "high_date": safe_parse_datetime,
+            "isin_code": str,
+            "instrument_type": str,
+            "issue_price": safe_convert_float,
+            "life_time_high": safe_convert_float,
+            "life_time_low": safe_convert_float,
+            "low_date": safe_parse_datetime,
+            "avm_buy_margin": safe_convert_float,
+            "avm_sell_margin": safe_convert_float,
+            "bcast_flag": safe_convert_bool,
+            "group_name": str,
+            "market_lot": safe_convert_int,
+            "nde_date": safe_parse_datetime,
+            "nds_date": safe_parse_datetime,
+            "nd_flag": safe_convert_bool,
+            "scrip_code": str,
+            "scrip_name": str,
+            "susp_status": str,
+            "suspension_reason": str,
+            "suspension_date": safe_parse_datetime,
+            "refresh_flag": safe_convert_bool,
+            "first_added_datetime": safe_parse_date,
+            "weeks_52_high": safe_convert_float,
+            "weeks_52_low": safe_convert_float,
+            "symbol": str,
+            "short_name": str,
+            "mfill": str,
         }
-
         for schema_field, schema_type in schema_fields.items():
             if schema_field in row:
                 if schema_type is str:
@@ -647,7 +618,6 @@ class Broker:
                 processed_row[schema_field] = None
 
         return processed_row
-
     async def get_symbol_token(self, instrument_key: str) -> str:
         """
         Retrieves the Breeze-specific token for a given instrument key.
@@ -657,14 +627,13 @@ class Broker:
             # Replace with your actual Breeze API call
             token = self.broker.get_security_master(Stock_Code=instrument_key, Exchange_Code="NSE")  # or BSE.
             token_value = token['Success'][0]['Token']
-            logging.info(f"Breeze: Getting token for {instrument_key}")
+            log_info(f"Breeze: Getting token for {instrument_key}")
             # await asyncio.sleep(0.1) #dummy
             # token = f"BREEZE_TOKEN_{instrument_key}"  # Dummy token
             return token_value
         except Exception as e:
-            logging.error(f"Breeze: Error getting symbol token for {instrument_key}: {e}")
+            log_exception(f"Breeze: Error getting symbol token for {instrument_key}: {e}")
             raise
-
     def get_iso_time(self,input_datetime: datetime) -> str:
         """
         Converts a string to an ISO 8601 formatted datetime string.
@@ -683,8 +652,6 @@ class Broker:
 
         except ValueError:
             return None
-
-
     def get_historical_data(self, data_request: historical_data_schema.HistoricalDataRequest) -> pd.DataFrame:
         """
         Fetches historical data from the Breeze API and returns a pandas DataFrame.
@@ -698,7 +665,7 @@ class Broker:
             current_datetime = datetime.now().astimezone(ZoneInfo("Asia/Kolkata"))
 
             if to_date > current_datetime:
-                logging.warning(f"to_date {to_date} exceeds current datetime; restricting to {current_datetime}.")
+                log_warning(f"to_date {to_date} exceeds current datetime; restricting to {current_datetime}.")
                 to_date = current_datetime
 
             if from_date >= to_date:
@@ -762,7 +729,7 @@ class Broker:
                 # Validate datetime column and parse it
                 if data.empty:
                     # Log and terminate the loop when no more data is returned
-                    logging.info(f"No data returned for the chunk from {current_date} to {to_date_chunk}. Terminating fetch.")
+                    log_info(f"No data returned for the chunk from {current_date} to {to_date_chunk}. Terminating fetch.")
                     break  # Exit the loop as there is no more data to fetch
 
                 data["datetime"] = pd.to_datetime(data["datetime"], errors="coerce", utc=True).dt.tz_convert("Asia/Kolkata")
@@ -794,9 +761,8 @@ class Broker:
             return []  # Return an empty list if no data was fetched
 
         except Exception as e:
-            logging.error(f"Error fetching historical data: {e}")
+            log_exception(f"Error fetching historical data: {e}")
             raise
-
     def subscribe(self,instrument_key: str = None,broker_token: str = None,interval: str = '1second',get_market_depth: bool = False,get_exchange_quotes: bool = True):
         """
         Subscribes to real-time feeds for a given symbol.
@@ -829,15 +795,14 @@ class Broker:
                     raise ValueError("Missing required parameters for options product type.")
                 # Implement Breeze API subscription logic
                 self.broker.subscribe_feeds(**subscribe_dict)
-                logging.info(f"Breeze: Subscribing to {instrument_key} with interval {interval}")
+                log_info(f"Breeze: Subscribing to {instrument_key} with interval {interval}")
             elif broker_token is not None:
                 subscribe_dict['stock_token'] = broker_token
                 self.broker.subscribe_feeds(**subscribe_dict)
-                logging.info(f"Breeze: Subscribing to  token {broker_token} with interval {interval}")                
+                log_info(f"Breeze: Subscribing to  token {broker_token} with interval {interval}")                
         except Exception as e:
-            logging.error(f"Breeze: Error subscribing to {instrument_key}: {e}")
+            log_exception(f"Breeze: Error subscribing to {instrument_key}: {e}")
             raise
-
     def unsubscribe(self,instrument_key: str = None,broker_token: str = None):
         """
         unSubscribes to real-time feeds for a given symbol.
@@ -866,15 +831,14 @@ class Broker:
                     raise ValueError("Missing required parameters for options product type.")
                 # Implement Breeze API subscription logic
                 self.broker.unsubscribe_feeds(**unsubscribe_dict)
-                logging.info(f"Breeze: unsubscribing to {instrument_key}")
+                log_info(f"Breeze: unsubscribing to {instrument_key}")
             elif broker_token is not None:
                 unsubscribe_dict['stock_token'] = broker_token
                 self.broker.unsubscribe_feeds(**unsubscribe_dict)
-                logging.info(f"Breeze: unsubscribing to  token {broker_token}")                
+                log_info(f"Breeze: unsubscribing to  token {broker_token}")                
         except Exception as e:
-            logging.error(f"Breeze: Error unsubscribing to {instrument_key}: {e}")
+            log_exception(f"Breeze: Error unsubscribing to {instrument_key}: {e}")
             raise
-
 
     async def process_feed(self, feed_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -930,24 +894,25 @@ class Broker:
                 "right": right,
                 "state": "U",  # Unprocessed state
                 }
-            logging.info(f"Breeze: Processed feed for {processed_feed['instrument_key']}")
+            log_info(f"Breeze: Processed feed for {processed_feed['instrument_key']}")
             return processed_feed
         except Exception as e:
-            logging.error(f"Breeze: Error processing feed data: {e}")
+            log_exception(f"Breeze: Error processing feed data: {e}")
             raise
 
     def _handle_tick_data_sync(self, tick_data: Dict[str, Any]):
         """
         Synchronous wrapper to call the async _handle_tick_data in a FastAPI-compatible way.
         """
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.run_coroutine_threadsafe(self._handle_tick_data(tick_data), loop)
-            else:
-                logging.error("FastAPI event loop is not running. Tick processing may fail.")
-        except Exception as e:
-            logging.error(f"Breeze: Error in _handle_tick_data_sync: {e}")
+        asyncio.create_task(self._handle_tick_data(tick_data))
+        # try:
+        #     loop = asyncio.get_event_loop()
+        #     if loop.is_running():
+        #         asyncio.run_coroutine_threadsafe(self._handle_tick_data(tick_data), loop)
+        #     else:
+        #         log_exception("FastAPI event loop is not running. Tick processing may fail.")
+        # except Exception as e:
+        #     log_exception(f"Breeze: Error in _handle_tick_data_sync: {e}")
 
     async def _handle_tick_data(self, tick_data: Dict[str, Any]):
         """
@@ -957,18 +922,18 @@ class Broker:
         try:
             # 1. Standardize the tick data format
             processed_feed = await self.process_feed(tick_data)
+            await self.market_data_manager.process_breeze_ticks(processed_feed)
+            # # 2. Add the processed feed to RedisService for batching
+            # redis = self.app.state.connections.get("redis")  # Get the Redis connection from app state
+            # if not hasattr(self, "redis_service"):
+            #     log_exception("RedisService is not initialized.")
+            #     return
 
-            # 2. Add the processed feed to RedisService for batching
-            redis = self.app.state.connections.get("redis")  # Get the Redis connection from app state
-            if not hasattr(self, "redis_service"):
-                logging.error("RedisService is not initialized.")
-                return
-
-            await self.app.state.redis_service.add_tick(processed_feed)
-            logging.info(f"Breeze: Tick data added to Redis batch - {processed_feed}")
+            # await self.app.state.redis_service.add_tick(processed_feed)
+            log_info(f"Breeze: Tick data added to Redis batch - {processed_feed}")
 
         except Exception as e:
-            logging.error(f"Breeze: Error handling tick data: {e}")
+            log_exception(f"Breeze: Error handling tick data: {e}")
 
     def _is_downloaded_today(self, filepath):
         """
@@ -1000,16 +965,16 @@ class Broker:
                                 if not chunk:
                                     break
                                 f.write(chunk)
-                        logging.info(f"Downloaded {url} to {filename}")
+                        log_info(f"Downloaded {url} to {filename}")
                         return filename
                     else:
-                        logging.error(f"Failed to download {url}: {response.status}")
+                        log_exception(f"Failed to download {url}: {response.status}")
                         return None  # Indicate failure
         except aiohttp.ClientError as e:
-            logging.error(f"aiohttp client error downloading {url}: {e}")
+            log_exception(f"aiohttp client error downloading {url}: {e}")
             return None
         except Exception as e:
-            logging.error(f"Unexpected error downloading {url}: {e}")
+            log_exception(f"Unexpected error downloading {url}: {e}")
             return None
 
     async def _extract_zip(self, zip_file_path, target_dir):
@@ -1020,7 +985,7 @@ class Broker:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(self.executor, self._extract_zip_sync, zip_file_path, target_dir)
         except Exception as e:
-            logging.error(f"Breeze: Error extracting zip file: {e}")
+            log_exception(f"Breeze: Error extracting zip file: {e}")
             raise
 
     def _extract_zip_sync(self, zip_file_path, target_dir):
@@ -1075,13 +1040,13 @@ class Broker:
                 for instrument_key in self.instrument_keys:
                     tick_data = self._generate_mock_tick(instrument_key)
                     await self._handle_tick_data(tick_data)  # Call the callback
-                    logging.info(f"Mock: Sent tick for {instrument_key}")
+                    log_info(f"Mock: Sent tick for {instrument_key}")
                     self.tick_count += 1
                     t.sleep(interval)  # Wait for the interval
                 if self.tick_count > 100:
                     break
         except Exception as e:
-            logging.error(f"MockBroker error: {e}")
+            log_exception(f"MockBroker error: {e}")
 
     def _generate_mock_tick(self, instrument_key: str) -> Dict[str, Any]:
         """
